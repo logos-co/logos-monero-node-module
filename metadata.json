@@ -1,0 +1,23 @@
+{
+  "name": "monero_node_module",
+  "display_name": "Monero Node RPC",
+  "version": "0.1.0",
+  "type": "core",
+  "interface": "cdylib",
+  "concurrency": "multi",
+  "category": "wallet",
+  "description": "Proxyable, fail-closed monerod JSON-RPC client. Per-network config (endpoint + proxy); socks5h/Tor-ready. Never runs a node.",
+  "author": "Logos Core Team",
+  "main": "monero_node_module_plugin",
+  "dependencies": [],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "rust": { "crate": "rust-lib", "trait": "MoneroNodeModule", "source": "src/glue.rs" }
+  },
+  "nix": {
+    "external_libraries": [],
+    "packages": { "build": [], "runtime": [] },
+    "cmake": { "find_packages": [], "extra_include_dirs": [] }
+  }
+}

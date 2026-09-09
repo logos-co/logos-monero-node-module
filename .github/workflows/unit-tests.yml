@@ -1,0 +1,55 @@
+name: monero_node_module Unit Tests
+
+# The proxy chokepoint and config store, run on every change. `--no-default-features` drops the
+# logos_module glue (and the logos-rust-sdk path dep), so this is plain cargo — no nix, no SDK
+# build, no network beyond crates.io. nix's own fetcher 403s crates.io; plain cargo does not.
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+concurrency:
+  group: unit-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    name: cargo test (pure core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+
+      - name: Provide the SDK manifest cargo insists on resolving
+        # --no-default-features never COMPILES the SDK, but cargo still resolves the manifest of
+        # the optional path dep, and logos-rust-sdk-src is gitignored (the nix builder stages it).
+        uses: actions/checkout@v4
+        with:
+          repository: logos-co/logos-rust-sdk
+          path: logos-rust-sdk-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-lib
+
+      - name: cargo test --no-default-features
+        run: cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked
+
+      - name: The fail-closed and config guards must actually be present
+        # A suite that silently stops compiling reads as coverage. Assert the load-bearing
+        # tests by name — the fail-closed proxy check above all.
+        run: |
+          out=$(cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked -- --list)
+          echo "$out"
+          for t in proxy_required_without_proxy_fails_closed \
+                   init_defaults_does_not_clobber_an_external_endpoint \
+                   unknown_network_is_refused \
+                   fail_closed_when_required_and_unset; do
+            echo "$out" | grep -q "$t" || { echo "MISSING guard test: $t"; exit 1; }
+          done

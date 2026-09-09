@@ -1,0 +1,28 @@
+name: monero_node_module against a public stagenet node
+project_name: logos-monero-node-module
+
+# Proves the module builds, loads under logoscore, and answers node_health against a real
+# public stagenet node through the fail-closed client. It does not assert a fixed height
+# (the live chain moves); it asserts the node is reachable and reports a plausible shape.
+
+intro: |
+  `monero_node_module` is the Monero wallet family's chain-data client. This drives it end to
+  end: build the module, load it headless, and ask a public stagenet node for its health.
+
+sections:
+  - title: "Build the module"
+    steps:
+      - title: "Build"
+        run: "nix build"
+
+  - title: "Seed a stagenet endpoint and read node health"
+    steps:
+      - title: "init defaults, then node_health(stagenet)"
+        run: |
+          nix build 'github:logos-co/logos-logoscore-cli{release}#cli-bundle-dir' --out-link ./logos
+          ./logos/bin/logoscore -m ./result/lib -l monero_node_module \
+            -c "monero_node_module.init_defaults()" \
+            -c "monero_node_module.node_health(stagenet)"
+        expect_contains:
+          - '"reachable":true'
+          - '"synced":true'
