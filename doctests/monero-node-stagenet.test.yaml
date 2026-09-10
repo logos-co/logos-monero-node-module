@@ -1,28 +1,73 @@
 name: monero_node_module against a public stagenet node
 project_name: logos-monero-node-module
 
-# Proves the module builds, loads under logoscore, and answers node_health against a real
-# public stagenet node through the fail-closed client. It does not assert a fixed height
+# Proves the module builds, loads under the logoscore daemon, and answers node_health against a
+# real public stagenet node through the fail-closed client. It does not assert a fixed height
 # (the live chain moves); it asserts the node is reachable and reports a plausible shape.
+#
+# Every build is a flake URL rather than a bare `nix build`: the harness runs each step in a
+# throwaway working directory, not in the checkout, so a relative build has nothing to build.
+# CI pins {release} to the commit under test with --release-for; a local run gets main.
+#
+# The shell here is POSIX: the harness runs steps under /bin/sh, which is dash on the Linux
+# runner — no `pipefail`, no here-strings, no arrays.
 
 intro: |
   `monero_node_module` is the Monero wallet family's chain-data client. This drives it end to
-  end: build the module, load it headless, and ask a public stagenet node for its health.
+  end: build the module, load it into a headless daemon, and ask a public stagenet node for its
+  health.
 
 sections:
-  - title: "Build the module"
+  - title: "Build the module and the runtime"
     steps:
       - title: "Build"
-        run: "nix build"
+        run: |
+          set -eu
+          nix build 'github:logos-co/logos-logoscore-cli{release}#cli-bundle-dir' --out-link ./logos
+          nix build 'github:logos-co/logos-monero-node-module{release}#install-portable' --no-write-lock-file -o result-node
+          ls result-node/modules
+        code_block: |
+          nix build 'github:logos-co/logos-logoscore-cli#cli-bundle-dir' --out-link ./logos
+          nix build 'github:logos-co/logos-monero-node-module#install-portable' -o result-node
+          ls result-node/modules
+        expect_contains: ["monero_node_module"]
 
   - title: "Seed a stagenet endpoint and read node health"
     steps:
       - title: "init defaults, then node_health(stagenet)"
+        # The daemon is the only interface the CLI has: the `-l` / `-c` one-shots were removed.
+        #
+        # A public node is somebody else's machine and goes down without notice, so the seeded
+        # default is tried first and two alternates after it. That is the module answering
+        # honestly about a dead endpoint — `reachable:false` with the transport error — and
+        # then being pointed somewhere else, which is the operation this step documents.
         run: |
-          nix build 'github:logos-co/logos-logoscore-cli{release}#cli-bundle-dir' --out-link ./logos
-          ./logos/bin/logoscore -m ./result/lib -l monero_node_module \
-            -c "monero_node_module.init_defaults()" \
-            -c "monero_node_module.node_health(stagenet)"
+          set -eu
+          export LOGOSCORE_CONFIG_DIR="$PWD/session"
+          rm -rf "$LOGOSCORE_CONFIG_DIR"; mkdir -p "$LOGOSCORE_CONFIG_DIR"
+          ./logos/bin/logoscore -m ./result-node/modules \
+            --persistence-path "$LOGOSCORE_CONFIG_DIR/data" daemon > daemon.log 2>&1 &
+          for i in $(seq 1 60); do
+            if grep -q 'Local client config' daemon.log; then break; fi
+            sleep 1
+          done
+          ./logos/bin/logoscore load-module monero_node_module
+          ./logos/bin/logoscore call monero_node_module init_defaults
+          health=$(./logos/bin/logoscore call monero_node_module node_health stagenet)
+          case "$health" in
+            *'\"reachable\":true'*) ;;
+            *)
+              for u in http://node2.monerodevs.org:38089 http://node3.monerodevs.org:38089; do
+                ./logos/bin/logoscore call monero_node_module set_node_config stagenet "str:{\"url\":\"$u\"}"
+                health=$(./logos/bin/logoscore call monero_node_module node_health stagenet)
+                case "$health" in *'\"reachable\":true'*) break;; esac
+              done
+              ;;
+          esac
+          echo "$health"
+          ./logos/bin/logoscore stop
+        # The daemon wraps a module's reply as a JSON STRING, so the fields inside it arrive
+        # escaped: a bare '"reachable":true' matches nothing here.
         expect_contains:
-          - '"reachable":true'
-          - '"synced":true'
+          - '\"reachable\":true'
+          - '\"synced\":true'
