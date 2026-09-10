@@ -41,6 +41,10 @@ sections:
         # default is tried first and two alternates after it. That is the module answering
         # honestly about a dead endpoint — `reachable:false` with the transport error — and
         # then being pointed somewhere else, which is the operation this step documents.
+        #
+        # The alternates are DISTINCT from the seeded default (node2), so this really is three
+        # hosts rather than two: a fallback list whose first entry is the default it is falling
+        # back from buys nothing.
         run: |
           set -eu
           export LOGOSCORE_CONFIG_DIR="$PWD/session"
@@ -57,7 +61,7 @@ sections:
           case "$health" in
             *'\"reachable\":true'*) ;;
             *)
-              for u in http://node2.monerodevs.org:38089 http://node3.monerodevs.org:38089; do
+              for u in http://node3.monerodevs.org:38089 http://node.monerodevs.org:38089; do
                 ./logos/bin/logoscore call monero_node_module set_node_config stagenet "str:{\"url\":\"$u\"}"
                 health=$(./logos/bin/logoscore call monero_node_module node_health stagenet)
                 case "$health" in *'\"reachable\":true'*) break;; esac
