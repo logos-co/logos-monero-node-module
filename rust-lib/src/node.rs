@@ -114,10 +114,16 @@ impl Nodes {
     }
 
     /// Replace one network's config from a full object. Refuses an unknown network.
-    pub fn set(&mut self, network: &str, cfg: NodeConfig) -> Result<()> {
+    ///
+    /// The URL is normalised on the way in. `post()` builds `{url}/{path}` by concatenation, so
+    /// a schemeless `host:port` — which is exactly what the wallet's own field used to ask for —
+    /// produces `host:port/json_rpc`, and reqwest rejects that as having no base. Storing it
+    /// verbatim turned a typo-shaped input into an obscure transport error much later.
+    pub fn set(&mut self, network: &str, mut cfg: NodeConfig) -> Result<()> {
         if !is_network(network) {
             return Err(NodeError::UnknownNetwork(network.into()));
         }
+        cfg.url = normalise_url(&cfg.url);
         self.map.insert(network.into(), cfg);
         self.persist()
     }
@@ -285,19 +291,45 @@ impl Nodes {
     }
 }
 
+/// Give a URL a scheme if it has none: `node.example:38089` -> `http://node.example:38089`.
+/// Left alone otherwise, including `https://` and any scheme a proxy setup might need.
+fn normalise_url(url: &str) -> String {
+    let u = url.trim();
+    if u.is_empty() || u.contains("://") { u.to_string() } else { format!("http://{u}") }
+}
+
 /// Well-known defaults so a fresh device works before any settings app has run. Public nodes
 /// for the live networks; loopback for a node the user runs themselves and for regtest.
+///
+/// These are somebody else's machines, and each daemon on them can wedge INDEPENDENTLY of the
+/// host: on 2026-09-10 `node.monerodevs.org:38089` accepted TCP and then never answered HTTP,
+/// while 18089 and 28089 on that same host served fine. So the stagenet default moved to node2,
+/// which was measured serving all three ports. A default cannot be more than a starting point —
+/// `set_node_config` is the answer, and the wallet's Wallets screen exposes it. Deliberately no
+/// automatic failover: on a privacy coin, silently moving a user's queries to a different
+/// operator is not a convenience.
 /// (network, url, trusted)
 pub const DEFAULT_ENDPOINTS: &[(&str, &str, bool)] = &[
-    ("mainnet",  "http://node.monerodevs.org:18089", false),
-    ("stagenet", "http://node.monerodevs.org:38089", false),
-    ("testnet",  "http://node.monerodevs.org:28089", false),
-    ("regtest",  "http://127.0.0.1:18081",           true),
+    ("mainnet",  "http://node.monerodevs.org:18089",  false),
+    ("stagenet", "http://node2.monerodevs.org:38089", false),
+    ("testnet",  "http://node.monerodevs.org:28089",  false),
+    ("regtest",  "http://127.0.0.1:18081",            true),
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_schemeless_url_gets_a_scheme_before_it_is_stored() {
+        let mut n = Nodes::new(None);
+        n.set("stagenet", cfg("node2.monerodevs.org:38089")).unwrap();
+        // Without this, post() would build "node2.monerodevs.org:38089/json_rpc".
+        assert_eq!(n.get("stagenet").unwrap().url, "http://node2.monerodevs.org:38089");
+        // A URL that already carries a scheme is left exactly as it was.
+        n.set("stagenet", cfg("https://my.node:443")).unwrap();
+        assert_eq!(n.get("stagenet").unwrap().url, "https://my.node:443");
+    }
 
     fn cfg(url: &str) -> NodeConfig {
         NodeConfig { url: url.into(), username: None, password: None, proxy: None,

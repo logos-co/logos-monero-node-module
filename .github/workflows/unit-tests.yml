@@ -50,6 +50,7 @@ jobs:
           for t in proxy_required_without_proxy_fails_closed \
                    init_defaults_does_not_clobber_an_external_endpoint \
                    unknown_network_is_refused \
+                   a_schemeless_url_gets_a_scheme_before_it_is_stored \
                    fail_closed_when_required_and_unset; do
             echo "$out" | grep -q "$t" || { echo "MISSING guard test: $t"; exit 1; }
           done
