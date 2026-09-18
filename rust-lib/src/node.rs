@@ -5,6 +5,9 @@
 //! request is built through the fail-closed [`crate::proxy`] chokepoint, so a network
 //! configured `proxyRequired` with no usable proxy refuses to call rather than leaking in the
 //! clear. Pure (no Logos deps) and unit-testable with `cargo test --no-default-features`.
+//!
+//! A network in `local` mode dials the node `monerod_module` runs in-process instead of its
+//! stored `url`, through the [`LocalNode`] seam.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -29,6 +32,15 @@ fn default_timeout() -> u64 {
     8
 }
 
+/// Where a network's calls go: its stored `url`, or the node `monerod_module` runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeMode {
+    #[default]
+    Remote,
+    Local,
+}
+
 /// One network's transport config. camelCase on the wire to match `chains.json` conventions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeConfig {
@@ -50,6 +62,9 @@ pub struct NodeConfig {
     /// "default" (seeded by init_defaults) or "external" (a UI wrote it).
     #[serde(default = "source_default")]
     pub source: String,
+    /// Absent from configs written before local mode existed, so those stay remote.
+    #[serde(default)]
+    pub mode: NodeMode,
 }
 
 fn source_default() -> String { "external".into() }
@@ -74,14 +89,25 @@ pub enum NodeError {
     Rpc { code: i64, message: String },
     #[error("parse: {0}")]
     Parse(String),
+    #[error("local node: {0}")]
+    Local(String),
 }
 
 type Result<T> = std::result::Result<T, NodeError>;
+
+/// The node `monerod_module` runs. A trait so the pure tests can stand one in.
+pub trait LocalNode: Send + Sync {
+    /// Its loopback RPC URL for `network`; empty if it cannot run that network.
+    fn rpc_url(&self, network: &str) -> std::result::Result<String, String>;
+    /// Its `status()`: state, network, height, peers, ...
+    fn status(&self) -> std::result::Result<Value, String>;
+}
 
 /// The persisted, per-network registry. `path` is `None` in pure tests.
 pub struct Nodes {
     map: BTreeMap<String, NodeConfig>,
     path: Option<PathBuf>,
+    local: Option<Box<dyn LocalNode>>,
 }
 
 impl Nodes {
@@ -91,7 +117,12 @@ impl Nodes {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str::<BTreeMap<String, NodeConfig>>(&s).ok())
             .unwrap_or_default();
-        Self { map, path }
+        Self { map, path, local: None }
+    }
+
+    pub fn with_local(mut self, local: Box<dyn LocalNode>) -> Self {
+        self.local = Some(local);
+        self
     }
 
     fn persist(&self) -> Result<()> {
@@ -123,6 +154,9 @@ impl Nodes {
         if !is_network(network) {
             return Err(NodeError::UnknownNetwork(network.into()));
         }
+        if cfg.mode == NodeMode::Local && network == "regtest" {
+            return Err(NodeError::Local("not available on regtest".into()));
+        }
         cfg.url = normalise_url(&cfg.url);
         self.map.insert(network.into(), cfg);
         self.persist()
@@ -151,6 +185,7 @@ impl Nodes {
                     timeout_secs: default_timeout(),
                     trusted: *trusted,
                     source: "default".into(),
+                    mode: NodeMode::Remote,
                 }
             });
             // Fill only genuinely-empty fields on an existing record.
@@ -182,8 +217,28 @@ impl Nodes {
         json!({ "ok": true, "state": state, "source": source, "networks": self.list() })
     }
 
+    /// The config a call actually uses. In local mode: the local node's loopback URL, trusted,
+    /// with no proxy or credentials, so a required proxy cannot fail-close a loopback call. The
+    /// stored remote fields stay on the record for a switch back. Never falls back to remote.
+    pub fn effective(&self, network: &str) -> Result<NodeConfig> {
+        let c = self.get(network).ok_or_else(|| NodeError::NotConfigured(network.into()))?;
+        if c.mode == NodeMode::Remote {
+            return Ok(c.clone());
+        }
+        let local = self.local.as_ref()
+            .ok_or_else(|| NodeError::Local("monerod_module is not available".into()))?;
+        let url = local.rpc_url(network).map_err(NodeError::Local)?;
+        if url.is_empty() {
+            return Err(NodeError::Local(format!("no local node for {network}")));
+        }
+        Ok(NodeConfig {
+            url, username: None, password: None, proxy: None, proxy_required: false,
+            timeout_secs: c.timeout_secs, trusted: true, source: c.source.clone(), mode: NodeMode::Local,
+        })
+    }
+
     fn client(&self, network: &str) -> Result<(reqwest::blocking::Client, NodeConfig)> {
-        let c = self.get(network).ok_or_else(|| NodeError::NotConfigured(network.into()))?.clone();
+        let c = self.effective(network)?;
         let client = build_client(&c.proxy_cfg()).map_err(|e| NodeError::Proxy(e.to_string()))?;
         Ok((client, c))
     }
@@ -265,12 +320,58 @@ impl Nodes {
             json!({ "amount_of_blocks": amount, "wallet_address": address, "starting_nonce": 0 }))
     }
 
-    /// `{ reachable, height, targetHeight, synced, restricted, rttMs }` — for a settings UI
-    /// and the wallet's sync chip. Never errors on an unreachable node: it reports it.
+    /// `{ reachable, height, targetHeight, synced, restricted, rttMs, mode }`, plus `local` (the
+    /// local node's status) in local mode. Never errors on an unreachable node: it reports it.
     pub fn node_health(&self, network: &str) -> Value {
         if !is_network(network) {
             return json!({ "ok": false, "error": format!("unknown network: {network}") });
         }
+        let mode = self.get(network).map(|c| c.mode).unwrap_or_default();
+        if mode == NodeMode::Remote {
+            let mut h = self.dial_health(network);
+            h["mode"] = json!(mode);
+            return h;
+        }
+        // Ask the local node first: when it is absent that one bounded call is the whole cost,
+        // which matters to a UI polling this every few seconds.
+        let local = self.local_status();
+        let mut h = if local["state"] == "unavailable" {
+            json!({ "ok": true, "reachable": false,
+                    "error": format!("local node: {}", local["error"].as_str().unwrap_or("unavailable")) })
+        } else {
+            self.dial_health(network)
+        };
+        h["mode"] = json!(mode);
+        h["local"] = local;
+        h
+    }
+
+    /// `{ ok, available, rpcUrl, status }`, whatever mode `network` is in: whether a settings UI
+    /// can offer local mode, and what the local node is doing.
+    pub fn local_node(&self, network: &str) -> Value {
+        if !is_network(network) {
+            return json!({ "ok": false, "error": format!("unknown network: {network}") });
+        }
+        let Some(local) = self.local.as_ref() else {
+            return json!({ "ok": true, "available": false, "error": "monerod_module is not available" });
+        };
+        match local.rpc_url(network) {
+            Ok(url) if !url.is_empty() =>
+                json!({ "ok": true, "available": true, "rpcUrl": url, "status": self.local_status() }),
+            Ok(_) => json!({ "ok": true, "available": false, "error": format!("no local node for {network}") }),
+            Err(e) => json!({ "ok": true, "available": false, "error": e }),
+        }
+    }
+
+    fn local_status(&self) -> Value {
+        match self.local.as_ref().map(|l| l.status()) {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => json!({ "state": "unavailable", "error": e }),
+            None => json!({ "state": "unavailable", "error": "monerod_module is not available" }),
+        }
+    }
+
+    fn dial_health(&self, network: &str) -> Value {
         let started = Instant::now();
         match self.get_info(network) {
             Ok((info, route)) => {
@@ -333,7 +434,8 @@ mod tests {
 
     fn cfg(url: &str) -> NodeConfig {
         NodeConfig { url: url.into(), username: None, password: None, proxy: None,
-                     proxy_required: false, timeout_secs: 8, trusted: false, source: "external".into() }
+                     proxy_required: false, timeout_secs: 8, trusted: false, source: "external".into(),
+                     mode: NodeMode::Remote }
     }
 
     #[test]
@@ -403,5 +505,119 @@ mod tests {
         }
         let reloaded = Nodes::new(Some(p));
         assert_eq!(reloaded.list().len(), 4);
+    }
+
+    struct FakeLocal(&'static str);
+    impl LocalNode for FakeLocal {
+        fn rpc_url(&self, _: &str) -> std::result::Result<String, String> { Ok(self.0.into()) }
+        fn status(&self) -> std::result::Result<Value, String> {
+            Ok(json!({ "state": "running", "network": "stagenet" }))
+        }
+    }
+
+    fn local(url: &str) -> NodeConfig {
+        NodeConfig { mode: NodeMode::Local, ..cfg(url) }
+    }
+
+    #[test]
+    fn a_config_written_before_local_mode_stays_remote() {
+        let c: NodeConfig = serde_json::from_str(r#"{"url":"http://n:38089"}"#).unwrap();
+        assert_eq!(c.mode, NodeMode::Remote);
+        assert!(serde_json::from_str::<NodeConfig>(r#"{"url":"x","mode":"Local"}"#).is_err());
+    }
+
+    #[test]
+    fn remote_mode_dials_the_stored_record_even_with_a_local_node() {
+        let mut n = Nodes::new(None).with_local(Box::new(FakeLocal("http://127.0.0.1:38081")));
+        n.set("stagenet", cfg("http://node2:38089")).unwrap();
+        assert_eq!(&n.effective("stagenet").unwrap(), n.get("stagenet").unwrap());
+    }
+
+    #[test]
+    fn local_mode_dials_loopback_trusted_unproxied_and_keeps_the_remote_half() {
+        let mut n = Nodes::new(None).with_local(Box::new(FakeLocal("http://127.0.0.1:38081")));
+        let mut c = local("http://node2:38089");
+        c.proxy = Some("socks5h://127.0.0.1:9050".into());
+        c.proxy_required = true;
+        c.username = Some("u".into());
+        c.password = Some("p".into());
+        n.set("stagenet", c.clone()).unwrap();
+        let e = n.effective("stagenet").unwrap();
+        assert_eq!(e.url, "http://127.0.0.1:38081");
+        assert!(e.trusted);
+        assert_eq!((e.proxy, e.proxy_required, e.username, e.password), (None, false, None, None));
+        assert_eq!(n.get("stagenet").unwrap(), &c);
+    }
+
+    #[test]
+    fn a_required_proxy_does_not_fail_close_the_local_node() {
+        // Nothing listens on port 1: the call must fail dialling loopback, not on the proxy rule.
+        let mut n = Nodes::new(None).with_local(Box::new(FakeLocal("http://127.0.0.1:1")));
+        let mut c = local("http://node:18089");
+        c.proxy_required = true;
+        n.set("stagenet", c).unwrap();
+        let r = n.get_info("stagenet");
+        assert!(matches!(r, Err(NodeError::Http(_))), "got {r:?}");
+    }
+
+    #[test]
+    fn without_the_daemon_module_local_mode_refuses_rather_than_goes_remote() {
+        let mut n = Nodes::new(None);
+        n.set("stagenet", local("http://node2:38089")).unwrap();
+        assert!(matches!(n.effective("stagenet"), Err(NodeError::Local(_))));
+        let h = n.node_health("stagenet");
+        assert_eq!((&h["reachable"], &h["mode"]), (&json!(false), &json!("local")));
+        assert_eq!(h["local"]["state"], "unavailable");
+        assert_eq!(n.local_node("stagenet")["available"], false);
+    }
+
+    #[test]
+    fn an_absent_daemon_module_costs_one_call_per_health_poll() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use std::sync::Arc;
+        struct Absent(Arc<AtomicUsize>);
+        impl LocalNode for Absent {
+            fn rpc_url(&self, _: &str) -> std::result::Result<String, String> {
+                self.0.fetch_add(1, SeqCst);
+                Err("object_unavailable".into())
+            }
+            fn status(&self) -> std::result::Result<Value, String> {
+                self.0.fetch_add(1, SeqCst);
+                Err("object_unavailable".into())
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut n = Nodes::new(None).with_local(Box::new(Absent(calls.clone())));
+        n.set("stagenet", local("http://node2:38089")).unwrap();
+        let h = n.node_health("stagenet");
+        assert_eq!((&h["reachable"], &h["local"]["state"]), (&json!(false), &json!("unavailable")));
+        assert_eq!(calls.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn local_mode_is_refused_on_regtest() {
+        let mut n = Nodes::new(None);
+        assert!(matches!(n.set("regtest", local("http://127.0.0.1:18081")), Err(NodeError::Local(_))));
+    }
+
+    #[test]
+    fn a_local_node_that_cannot_run_the_network_is_not_offered() {
+        let n = Nodes::new(None).with_local(Box::new(FakeLocal("")));
+        assert_eq!(n.local_node("stagenet")["available"], false);
+    }
+
+    #[test]
+    fn health_reports_the_mode_and_the_local_status() {
+        let mut n = Nodes::new(None).with_local(Box::new(FakeLocal("http://127.0.0.1:1")));
+        n.set("stagenet", local("http://node2:38089")).unwrap();
+        let h = n.node_health("stagenet");
+        assert_eq!(h["mode"], "local");
+        assert_eq!(h["local"]["state"], "running");
+        let v = n.local_node("stagenet");
+        assert_eq!((&v["available"], &v["rpcUrl"]), (&json!(true), &json!("http://127.0.0.1:1")));
+        n.set("stagenet", cfg("http://192.0.2.1:38089")).unwrap();
+        let h = n.node_health("stagenet");
+        assert_eq!(h["mode"], "remote");
+        assert!(h.get("local").is_none());
     }
 }

@@ -4330,6 +4330,33 @@
         "type": "github"
       }
     },
+    "logos-monero-nix": {
+      "inputs": {
+        "logos-nix": [
+          "monerod_module",
+          "logos-module-builder",
+          "logos-nix"
+        ],
+        "nixpkgs": [
+          "monerod_module",
+          "logos-module-builder",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1789756471,
+        "narHash": "sha256-oYyha+9jIqV1gPV0TlqOX85rtFlul8gLMuztcwQ6Lyg=",
+        "owner": "logos-co",
+        "repo": "logos-monero-nix",
+        "rev": "f981568d2238c6f37f34aca5a45563ec326447dd",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-monero-nix",
+        "type": "github"
+      }
+    },
     "logos-nix": {
       "inputs": {
         "nixpkgs": "nixpkgs",
@@ -11331,6 +11358,27 @@
         "type": "github"
       }
     },
+    "monerod_module": {
+      "inputs": {
+        "logos-module-builder": [
+          "logos-module-builder"
+        ],
+        "logos-monero-nix": "logos-monero-nix"
+      },
+      "locked": {
+        "lastModified": 1789756892,
+        "narHash": "sha256-HDPudd/DPfSXbrqAqIOigDCm8tF1JDzHBLnYAy48PJA=",
+        "owner": "logos-co",
+        "repo": "logos-monerod-module",
+        "rev": "1ea896a8ad34ec7547d8751f829a791660b3880c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-monerod-module",
+        "type": "github"
+      }
+    },
     "nix-bundle-appimage": {
       "inputs": {
         "logos-nix": [
@@ -17847,7 +17895,8 @@
     },
     "root": {
       "inputs": {
-        "logos-module-builder": "logos-module-builder"
+        "logos-module-builder": "logos-module-builder",
+        "monerod_module": "monerod_module"
       }
     },
     "rust-overlay": {

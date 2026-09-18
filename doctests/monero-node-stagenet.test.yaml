@@ -75,3 +75,71 @@ sections:
         expect_contains:
           - '\"reachable\":true'
           - '\"synced\":true'
+
+  - title: "Local mode: dial the node monerod_module runs"
+    steps:
+      - title: "Without monerod_module, local mode refuses rather than going remote"
+        # monerod_module is an OPTIONAL dependency, so #install stages this module alone.
+        run: |
+          set -eu
+          export LOGOSCORE_CONFIG_DIR="$PWD/session-absent"
+          rm -rf "$LOGOSCORE_CONFIG_DIR"; mkdir -p "$LOGOSCORE_CONFIG_DIR"
+          ./logos/bin/logoscore -m ./result-node/modules \
+            --persistence-path "$LOGOSCORE_CONFIG_DIR/data" daemon > daemon-absent.log 2>&1 &
+          for i in $(seq 1 60); do
+            if grep -q 'Local client config' daemon-absent.log; then break; fi
+            sleep 1
+          done
+          ./logos/bin/logoscore load-module monero_node_module
+          ./logos/bin/logoscore call monero_node_module init_defaults
+          ./logos/bin/logoscore call monero_node_module set_node_config stagenet \
+            'str:{"url":"http://node2.monerodevs.org:38089","mode":"local"}'
+          ./logos/bin/logoscore call monero_node_module local_node stagenet
+          ./logos/bin/logoscore call monero_node_module effective_node stagenet
+          ./logos/bin/logoscore call monero_node_module node_health stagenet
+          ./logos/bin/logoscore stop
+        expect_contains:
+          - '\"available\":false'
+          - 'local node: monerod_module'
+          - '\"mode\":\"local\"'
+          - '\"state\":\"unavailable\"'
+      - title: "With monerod_module, local mode dials its loopback node, trusted"
+        # proxyRequired is stored ON: it must not fail-close a loopback call. The node answers
+        # get_info as soon as its RPC binds, before it has any peers.
+        run: |
+          set -eu
+          nix build 'github:logos-co/logos-monerod-module{release}#install-portable' --no-write-lock-file -o result-monerod
+          rm -rf tree; mkdir -p tree
+          cp -rL result-node/modules/* result-monerod/modules/* tree/
+          chmod -R u+w tree
+          export LOGOSCORE_CONFIG_DIR="$PWD/session-present"
+          rm -rf "$LOGOSCORE_CONFIG_DIR"; mkdir -p "$LOGOSCORE_CONFIG_DIR"
+          ./logos/bin/logoscore -m ./tree \
+            --persistence-path "$LOGOSCORE_CONFIG_DIR/data" daemon > daemon-present.log 2>&1 &
+          for i in $(seq 1 60); do
+            if grep -q 'Local client config' daemon-present.log; then break; fi
+            sleep 1
+          done
+          ./logos/bin/logoscore load-module monerod_module
+          ./logos/bin/logoscore load-module monero_node_module
+          ./logos/bin/logoscore call monero_node_module init_defaults
+          ./logos/bin/logoscore call monero_node_module set_node_config stagenet \
+            'str:{"url":"http://node2.monerodevs.org:38089","proxyRequired":true,"mode":"local"}'
+          ./logos/bin/logoscore call monero_node_module local_node stagenet
+          ./logos/bin/logoscore call monero_node_module effective_node stagenet
+          ./logos/bin/logoscore call monerod_module start stagenet
+          for i in $(seq 1 60); do
+            health=$(./logos/bin/logoscore call monero_node_module node_health stagenet)
+            case "$health" in *'\"reachable\":true'*) break;; esac
+            sleep 2
+          done
+          echo "$health"
+          ./logos/bin/logoscore call monerod_module stop
+          ./logos/bin/logoscore stop
+        expect_contains:
+          - '\"available\":true'
+          - '\"url\":\"http://127.0.0.1:38081\"'
+          - '\"trusted\":true'
+          - '\"reachable\":true'
+          - '\"route\":\"direct\"'
+          - '\"state\":\"running\"'

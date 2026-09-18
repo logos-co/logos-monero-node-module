@@ -3,6 +3,11 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
+    # OPTIONAL in metadata.json: only its LIDL contract is consumed.
+    monerod_module = {
+      url = "github:logos-co/logos-monerod-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
