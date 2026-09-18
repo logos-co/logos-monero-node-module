@@ -22,7 +22,7 @@ or `{ "ok": false, "error": … }`. Config: `set_node_config` / `get_node_config
 ## Local mode
 
 A network set to `"mode": "local"` dials the node that
-[`monerod_module`](../logos-monerod-module) runs in-process, instead of its stored `url`.
+[`monerod_module`](https://github.com/logos-co/logos-monerod-module) runs in-process, instead of its stored `url`.
 `monerod_module` is an **optional** dependency: never bundled, never auto-loaded.
 
 - `effective_node(network)` is what a wallet dials: in local mode, the daemon's loopback URL,
