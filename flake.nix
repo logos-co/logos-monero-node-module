@@ -3,6 +3,11 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
+    # OPTIONAL in metadata.json: only its LIDL contract is consumed. TODO: github: once published.
+    monerod_module = {
+      url = "git+file:///Users/dlipicar/repos/logos-monerod-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:

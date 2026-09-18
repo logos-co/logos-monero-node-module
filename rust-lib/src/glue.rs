@@ -11,15 +11,22 @@
 //! the write lock.
 
 use std::sync::RwLock;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::node::{is_network, NodeConfig, Nodes};
+use crate::node::{is_network, LocalNode, NodeConfig, Nodes};
 
 pub trait MoneroNodeModule: Send + Sync + 'static {
-    /// Store one network's config from `{ url, username?, password?, proxy?, proxyRequired?, timeoutSecs?, trusted? }`.
+    /// Store one network's config from `{ url, username?, password?, proxy?, proxyRequired?, timeoutSecs?, trusted?, mode? }`.
+    /// A full replace: `mode` is `remote` unless the config says `local`.
     fn set_node_config(&self, network: String, config_json: String) -> String;
     fn get_node_config(&self, network: String) -> String;
+    /// What a wallet dials: the stored config, or in local mode monerod_module's loopback URL,
+    /// trusted and unproxied. `{ ok, result }` like get_node_config.
+    fn effective_node(&self, network: String) -> String;
+    /// `{ ok, available, rpcUrl?, status?, error? }`: whether monerod_module can serve `network`.
+    fn local_node(&self, network: String) -> String;
     fn remove_node_config(&self, network: String) -> bool;
     /// `{ ok, networks: [name, ...] }`.
     fn list_networks(&self) -> String;
@@ -29,7 +36,7 @@ pub trait MoneroNodeModule: Send + Sync + 'static {
     /// Seed well-known defaults per-field-if-absent. `{ ok, applied: [...] }`.
     fn init_defaults(&self) -> String;
 
-    /// `{ reachable, height, targetHeight, synced, restricted, rttMs }`.
+    /// `{ reachable, height, targetHeight, synced, restricted, rttMs, mode, local? }`.
     fn node_health(&self, network: String) -> String;
 
     fn get_info(&self, network: String) -> String;
@@ -53,6 +60,38 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
 
 struct MoneroNodeModuleImpl {
     nodes: RwLock<Nodes>,
+}
+
+/// Bounded so an absent monerod_module costs 1.5 s, not the 20 s protocol deadline.
+const LOCAL_BUDGET: Duration = Duration::from_millis(1500);
+
+/// monerod_module, an OPTIONAL dependency: when it is not loaded, local mode reports it.
+struct MonerodLocal;
+
+impl LocalNode for MonerodLocal {
+    fn rpc_url(&self, network: &str) -> std::result::Result<String, String> {
+        monerod_module::MonerodModuleClient::new()
+            .rpc_endpoint_with_timeout(network, LOCAL_BUDGET)
+            .map_err(why)
+    }
+
+    fn status(&self) -> std::result::Result<Value, String> {
+        monerod_module::MonerodModuleClient::new()
+            .status_with_timeout(LOCAL_BUDGET)
+            .map_err(why)
+    }
+}
+
+/// The SDK's error text ends in a `{ "code", ... }` object; name the absent case plainly.
+fn why(e: impl std::fmt::Display) -> String {
+    let s = e.to_string();
+    let code = s.find('{')
+        .and_then(|i| serde_json::from_str::<Value>(&s[i..]).ok())
+        .and_then(|v| v.get("code").and_then(Value::as_str).map(str::to_owned));
+    match code.as_deref() {
+        Some("object_unavailable") => "monerod_module is not loaded".into(),
+        _ => format!("monerod_module: {s}"),
+    }
 }
 
 impl Default for MoneroNodeModuleImpl {
@@ -85,7 +124,7 @@ impl MoneroNodeModuleImpl {
 impl MoneroNodeModule for MoneroNodeModuleImpl {
     fn on_context_ready(&self, ctx: &RustModuleContext) {
         let path = std::path::Path::new(&ctx.instance_persistence_path).join("monero_nodes.json");
-        *self.nodes.write().unwrap() = Nodes::new(Some(path));
+        *self.nodes.write().unwrap() = Nodes::new(Some(path)).with_local(Box::new(MonerodLocal));
     }
 
     fn set_node_config(&self, network: String, config_json: String) -> String {
@@ -104,6 +143,17 @@ impl MoneroNodeModule for MoneroNodeModuleImpl {
             Some(c) => json!({ "ok": true, "result": c }).to_string(),
             None => err(format!("network not configured: {network}")),
         }
+    }
+
+    fn effective_node(&self, network: String) -> String {
+        match self.nodes.read().unwrap().effective(&network) {
+            Ok(c) => json!({ "ok": true, "result": c }).to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    fn local_node(&self, network: String) -> String {
+        self.nodes.read().unwrap().local_node(&network).to_string()
     }
 
     fn remove_node_config(&self, network: String) -> bool {

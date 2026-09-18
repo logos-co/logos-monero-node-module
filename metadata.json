@@ -6,10 +6,11 @@
   "interface": "cdylib",
   "concurrency": "multi",
   "category": "wallet",
-  "description": "Proxyable, fail-closed monerod JSON-RPC client. Per-network config (endpoint + proxy); socks5h/Tor-ready. Never runs a node.",
+  "description": "Proxyable, fail-closed monerod JSON-RPC client. Per-network config (endpoint + proxy); socks5h/Tor-ready. Never runs a node itself; local mode dials the one monerod_module runs.",
   "author": "Logos Core Team",
   "main": "monero_node_module_plugin",
   "dependencies": [],
+  "optional_dependencies": ["monerod_module"],
   "include": [],
   "capabilities": [],
   "codegen": {
