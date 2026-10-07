@@ -10,7 +10,9 @@
   "author": "Logos Core Team",
   "main": "monero_node_module_plugin",
   "dependencies": [],
-  "optional_dependencies": ["monerod_module"],
+  "optional_dependencies": [
+    { "name": "monerod_module", "version": "~0.1.0" }
+  ],
   "include": [],
   "capabilities": [],
   "codegen": {
