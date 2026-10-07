@@ -4344,11 +4344,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1789756471,
-        "narHash": "sha256-oYyha+9jIqV1gPV0TlqOX85rtFlul8gLMuztcwQ6Lyg=",
+        "lastModified": 1791386279,
+        "narHash": "sha256-HengjaXSqRoS6nUJTHaOdjq+1C65EXjD7pnWmeg7neg=",
         "owner": "logos-co",
         "repo": "logos-monero-nix",
-        "rev": "f981568d2238c6f37f34aca5a45563ec326447dd",
+        "rev": "682fa053609b29416789fbe73eba57cc06cd6cd3",
         "type": "github"
       },
       "original": {
@@ -11366,11 +11366,11 @@
         "logos-monero-nix": "logos-monero-nix"
       },
       "locked": {
-        "lastModified": 1789756892,
-        "narHash": "sha256-HDPudd/DPfSXbrqAqIOigDCm8tF1JDzHBLnYAy48PJA=",
+        "lastModified": 1791386513,
+        "narHash": "sha256-wkMOlyDZd/D4onEWa4XA3B1UzTh635CxqUx5EX3viX4=",
         "owner": "logos-co",
         "repo": "logos-monerod-module",
-        "rev": "1ea896a8ad34ec7547d8751f829a791660b3880c",
+        "rev": "bcf628cb5065abb124f0749642a2bfdebbe6553d",
         "type": "github"
       },
       "original": {
