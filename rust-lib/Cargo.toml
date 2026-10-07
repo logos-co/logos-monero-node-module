@@ -1,6 +1,6 @@
 [package]
 name = "monero_node_module"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Logos monero_node_module — proxyable, fail-closed monerod JSON-RPC client (per-network config)."
 rust-version = "1.89"
