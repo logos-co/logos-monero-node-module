@@ -1,7 +1,7 @@
 name: monero_node_module against a public stagenet node
 project_name: logos-monero-node-module
 
-# Proves the module builds, loads under the logoscore daemon, and answers node_health against a
+# Proves the module builds, loads under the logosctl daemon, and answers node_health against a
 # real public stagenet node through the fail-closed client. It does not assert a fixed height
 # (the live chain moves); it asserts the node is reachable and reports a plausible shape.
 #
@@ -23,11 +23,11 @@ sections:
       - title: "Build"
         run: |
           set -eu
-          nix build 'github:logos-co/logos-logoscore-cli{release}#cli-bundle-dir' --out-link ./logos
+          nix build 'github:logos-co/logos-logoscore-cli{release}#ctl-bundle-dir' --out-link ./logos
           nix build 'github:logos-co/logos-monero-node-module{release}#install-portable' --no-write-lock-file -o result-node
           ls result-node/modules
         code_block: |
-          nix build 'github:logos-co/logos-logoscore-cli#cli-bundle-dir' --out-link ./logos
+          nix build 'github:logos-co/logos-logoscore-cli#ctl-bundle-dir' --out-link ./logos
           nix build 'github:logos-co/logos-monero-node-module#install-portable' -o result-node
           ls result-node/modules
         expect_contains: ["monero_node_module"]
@@ -47,29 +47,25 @@ sections:
         # back from buys nothing.
         run: |
           set -eu
-          export LOGOSCORE_CONFIG_DIR="$PWD/session"
-          rm -rf "$LOGOSCORE_CONFIG_DIR"; mkdir -p "$LOGOSCORE_CONFIG_DIR"
-          ./logos/bin/logoscore -m ./result-node/modules \
-            --persistence-path "$LOGOSCORE_CONFIG_DIR/data" daemon > daemon.log 2>&1 &
-          for i in $(seq 1 60); do
-            if grep -q 'Local client config' daemon.log; then break; fi
-            sleep 1
-          done
-          ./logos/bin/logoscore load-module monero_node_module
-          ./logos/bin/logoscore call monero_node_module init_defaults
-          health=$(./logos/bin/logoscore call monero_node_module node_health stagenet)
+          export LOGOSCTL_CONFIG_DIR="$PWD/session"
+          rm -rf "$LOGOSCTL_CONFIG_DIR"; mkdir -p "$LOGOSCTL_CONFIG_DIR" home
+          printf 'modules_dirs: [%s]\n' "$PWD/result-node/modules" | ./logos/bin/logosctl daemon config set - > /dev/null
+          HOME="$PWD/home" ./logos/bin/logosctl daemon start --detach
+          ./logos/bin/logosctl module load monero_node_module
+          ./logos/bin/logosctl call monero_node_module init_defaults
+          health=$(./logos/bin/logosctl call monero_node_module node_health stagenet)
           case "$health" in
             *'\"reachable\":true'*) ;;
             *)
               for u in http://node3.monerodevs.org:38089 http://node.monerodevs.org:38089; do
-                ./logos/bin/logoscore call monero_node_module set_node_config stagenet "str:{\"url\":\"$u\"}"
-                health=$(./logos/bin/logoscore call monero_node_module node_health stagenet)
+                ./logos/bin/logosctl call monero_node_module set_node_config stagenet "str:{\"url\":\"$u\"}"
+                health=$(./logos/bin/logosctl call monero_node_module node_health stagenet)
                 case "$health" in *'\"reachable\":true'*) break;; esac
               done
               ;;
           esac
           echo "$health"
-          ./logos/bin/logoscore stop
+          ./logos/bin/logosctl daemon stop
         # The daemon wraps a module's reply as a JSON STRING, so the fields inside it arrive
         # escaped: a bare '"reachable":true' matches nothing here.
         expect_contains:
@@ -82,22 +78,18 @@ sections:
         # monerod_module is an OPTIONAL dependency, so #install stages this module alone.
         run: |
           set -eu
-          export LOGOSCORE_CONFIG_DIR="$PWD/session-absent"
-          rm -rf "$LOGOSCORE_CONFIG_DIR"; mkdir -p "$LOGOSCORE_CONFIG_DIR"
-          ./logos/bin/logoscore -m ./result-node/modules \
-            --persistence-path "$LOGOSCORE_CONFIG_DIR/data" daemon > daemon-absent.log 2>&1 &
-          for i in $(seq 1 60); do
-            if grep -q 'Local client config' daemon-absent.log; then break; fi
-            sleep 1
-          done
-          ./logos/bin/logoscore load-module monero_node_module
-          ./logos/bin/logoscore call monero_node_module init_defaults
-          ./logos/bin/logoscore call monero_node_module set_node_config stagenet \
+          export LOGOSCTL_CONFIG_DIR="$PWD/session-absent"
+          rm -rf "$LOGOSCTL_CONFIG_DIR"; mkdir -p "$LOGOSCTL_CONFIG_DIR" home
+          printf 'modules_dirs: [%s]\n' "$PWD/result-node/modules" | ./logos/bin/logosctl daemon config set - > /dev/null
+          HOME="$PWD/home" ./logos/bin/logosctl daemon start --detach
+          ./logos/bin/logosctl module load monero_node_module
+          ./logos/bin/logosctl call monero_node_module init_defaults
+          ./logos/bin/logosctl call monero_node_module set_node_config stagenet \
             'str:{"url":"http://node2.monerodevs.org:38089","mode":"local"}'
-          ./logos/bin/logoscore call monero_node_module local_node stagenet
-          ./logos/bin/logoscore call monero_node_module effective_node stagenet
-          ./logos/bin/logoscore call monero_node_module node_health stagenet
-          ./logos/bin/logoscore stop
+          ./logos/bin/logosctl call monero_node_module local_node stagenet
+          ./logos/bin/logosctl call monero_node_module effective_node stagenet
+          ./logos/bin/logosctl call monero_node_module node_health stagenet
+          ./logos/bin/logosctl daemon stop
         expect_contains:
           - '\"available\":false'
           - 'local node: monerod_module'
@@ -112,30 +104,26 @@ sections:
           rm -rf tree; mkdir -p tree
           cp -rL result-node/modules/* result-monerod/modules/* tree/
           chmod -R u+w tree
-          export LOGOSCORE_CONFIG_DIR="$PWD/session-present"
-          rm -rf "$LOGOSCORE_CONFIG_DIR"; mkdir -p "$LOGOSCORE_CONFIG_DIR"
-          ./logos/bin/logoscore -m ./tree \
-            --persistence-path "$LOGOSCORE_CONFIG_DIR/data" daemon > daemon-present.log 2>&1 &
-          for i in $(seq 1 60); do
-            if grep -q 'Local client config' daemon-present.log; then break; fi
-            sleep 1
-          done
-          ./logos/bin/logoscore load-module monerod_module
-          ./logos/bin/logoscore load-module monero_node_module
-          ./logos/bin/logoscore call monero_node_module init_defaults
-          ./logos/bin/logoscore call monero_node_module set_node_config stagenet \
+          export LOGOSCTL_CONFIG_DIR="$PWD/session-present"
+          rm -rf "$LOGOSCTL_CONFIG_DIR"; mkdir -p "$LOGOSCTL_CONFIG_DIR" home
+          printf 'modules_dirs: [%s]\n' "$PWD/tree" | ./logos/bin/logosctl daemon config set - > /dev/null
+          HOME="$PWD/home" ./logos/bin/logosctl daemon start --detach
+          ./logos/bin/logosctl module load monerod_module
+          ./logos/bin/logosctl module load monero_node_module
+          ./logos/bin/logosctl call monero_node_module init_defaults
+          ./logos/bin/logosctl call monero_node_module set_node_config stagenet \
             'str:{"url":"http://node2.monerodevs.org:38089","proxyRequired":true,"mode":"local"}'
-          ./logos/bin/logoscore call monero_node_module local_node stagenet
-          ./logos/bin/logoscore call monero_node_module effective_node stagenet
-          ./logos/bin/logoscore call monerod_module start stagenet
+          ./logos/bin/logosctl call monero_node_module local_node stagenet
+          ./logos/bin/logosctl call monero_node_module effective_node stagenet
+          ./logos/bin/logosctl call monerod_module start stagenet
           for i in $(seq 1 60); do
-            health=$(./logos/bin/logoscore call monero_node_module node_health stagenet)
+            health=$(./logos/bin/logosctl call monero_node_module node_health stagenet)
             case "$health" in *'\"reachable\":true'*) break;; esac
             sleep 2
           done
           echo "$health"
-          ./logos/bin/logoscore call monerod_module stop
-          ./logos/bin/logoscore stop
+          ./logos/bin/logosctl call monerod_module stop
+          ./logos/bin/logosctl daemon stop
         expect_contains:
           - '\"available\":true'
           - '\"url\":\"http://127.0.0.1:38081\"'
