@@ -9,8 +9,12 @@
 //! the Logos glue is behind the default `logos_module` feature.
 mod proxy;
 mod node;
+mod tor;
+#[cfg_attr(not(feature = "logos_module"), allow(dead_code))]
+mod gate;
 
 pub use node::{is_network, LocalNode, NodeConfig, NodeMode, Nodes, NETWORKS};
+pub use tor::{TorUse, TorView};
 
 #[cfg(feature = "logos_module")]
 mod glue;

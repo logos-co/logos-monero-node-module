@@ -6,10 +6,12 @@
   "interface": "cdylib",
   "concurrency": "multi",
   "category": "wallet",
-  "description": "Proxyable, fail-closed monerod JSON-RPC client. Per-network config (endpoint + proxy); socks5h/Tor-ready. Never runs a node itself; local mode dials the one monerod_module runs.",
+  "description": "Fail-closed monerod JSON-RPC client and the Monero wallet's node per network. \"Use Tor for\" (all, identifying or none) picks a direct node or one over Tor, the Tor that comes with Logos (tor_module) by default. Never runs a node itself; local mode dials the one monerod_module runs.",
   "author": "Logos Core Team",
   "main": "monero_node_module_plugin",
-  "dependencies": [],
+  "dependencies": [
+    { "name": "tor_module", "version": "~0.1.0" }
+  ],
   "optional_dependencies": [
     { "name": "monerod_module", "version": "~0.1.0" }
   ],

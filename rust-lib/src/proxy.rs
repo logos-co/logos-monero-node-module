@@ -23,11 +23,18 @@ pub struct ProxyConfig {
     pub proxy_required: bool,
     /// Per-request timeout in seconds. `0` leaves reqwest's default.
     pub timeout_secs: u64,
+    /// Accept a TLS certificate no root vouches for, as monerod's self-made one.
+    pub accept_self_signed: bool,
 }
 
 impl ProxyConfig {
     pub fn new(proxy: Option<String>, proxy_required: bool, timeout_secs: u64) -> Self {
-        Self { proxy, proxy_required, timeout_secs }
+        Self { proxy, proxy_required, timeout_secs, accept_self_signed: false }
+    }
+
+    pub fn accept_self_signed(mut self, yes: bool) -> Self {
+        self.accept_self_signed = yes;
+        self
     }
 }
 
@@ -69,6 +76,9 @@ pub fn build_client(cfg: &ProxyConfig) -> Result<reqwest::blocking::Client, Prox
 
     if cfg.timeout_secs > 0 {
         builder = builder.timeout(Duration::from_secs(cfg.timeout_secs));
+    }
+    if cfg.accept_self_signed {
+        builder = builder.danger_accept_invalid_certs(true);
     }
 
     builder.build().map_err(|e| ProxyError::Build(e.to_string()))

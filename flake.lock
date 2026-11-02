@@ -17896,7 +17896,8 @@
     "root": {
       "inputs": {
         "logos-module-builder": "logos-module-builder",
-        "monerod_module": "monerod_module"
+        "monerod_module": "monerod_module",
+        "tor_module": "tor_module"
       }
     },
     "rust-overlay": {
@@ -17996,6 +17997,26 @@
       "original": {
         "owner": "oxalica",
         "repo": "rust-overlay",
+        "type": "github"
+      }
+    },
+    "tor_module": {
+      "inputs": {
+        "logos-module-builder": [
+          "logos-module-builder"
+        ]
+      },
+      "locked": {
+        "lastModified": 1793396235,
+        "narHash": "sha256-uhF/cCnFvKZCYNN/o+LQytsDiV73xyBtmD+3nR6NO30=",
+        "owner": "logos-co",
+        "repo": "logos-tor-module",
+        "rev": "82cfdc98c7a2694db53d0f0d1f5680c78082e648",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-tor-module",
         "type": "github"
       }
     }
