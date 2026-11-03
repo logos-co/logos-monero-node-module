@@ -3,6 +3,11 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
+    # The built-in Tor; only its contract is consumed.
+    tor_module = {
+      url = "github:logos-co/logos-tor-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+    };
     # OPTIONAL in metadata.json: only its LIDL contract is consumed.
     monerod_module = {
       url = "github:logos-co/logos-monerod-module";

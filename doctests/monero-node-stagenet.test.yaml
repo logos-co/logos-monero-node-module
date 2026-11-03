@@ -2,8 +2,9 @@ name: monero_node_module against a public stagenet node
 project_name: logos-monero-node-module
 
 # Proves the module builds, loads under the logosctl daemon, and answers node_health against a
-# real public stagenet node through the fail-closed client. It does not assert a fixed height
-# (the live chain moves); it asserts the node is reachable and reports a plausible shape.
+# real public stagenet node through the fail-closed client, directly and over the Tor that
+# comes with Logos. It does not assert a fixed height (the live chain moves); it asserts the
+# node is reachable and reports a plausible shape.
 #
 # Every build is a flake URL rather than a bare `nix build`: the harness runs each step in a
 # throwaway working directory, not in the checkout, so a relative build has nothing to build.
@@ -25,16 +26,21 @@ sections:
           set -eu
           nix build 'github:logos-co/logos-logoscore-cli{release}#ctl-bundle-dir' --out-link ./logos
           nix build 'github:logos-co/logos-monero-node-module{release}#install-portable' --no-write-lock-file -o result-node
-          ls result-node/modules
+          nix build 'github:logos-co/logos-tor-module{release}#install-portable' --no-write-lock-file -o result-tor
+          rm -rf base; mkdir -p base
+          cp -rL result-node/modules/* result-tor/modules/* base/
+          chmod -R u+w base
+          ls base
         code_block: |
           nix build 'github:logos-co/logos-logoscore-cli#ctl-bundle-dir' --out-link ./logos
           nix build 'github:logos-co/logos-monero-node-module#install-portable' -o result-node
-          ls result-node/modules
-        expect_contains: ["monero_node_module"]
+          nix build 'github:logos-co/logos-tor-module#install-portable' -o result-tor
+          mkdir -p base && cp -rL result-node/modules/* result-tor/modules/* base/
+        expect_contains: ["monero_node_module", "tor_module"]
 
   - title: "Seed a stagenet endpoint and read node health"
     steps:
-      - title: "init defaults, then node_health(stagenet)"
+      - title: "init defaults, then node_health(stagenet), every connection direct"
         # The daemon is the only interface the CLI has: the `-l` / `-c` one-shots were removed.
         #
         # A public node is somebody else's machine and goes down without notice, so the seeded
@@ -45,13 +51,23 @@ sections:
         # The alternates are DISTINCT from the seeded default (node2), so this really is three
         # hosts rather than two: a fallback list whose first entry is the default it is falling
         # back from buys nothing.
+        #
+        # "Use Tor for" is set to Nothing first. Only the wallet backend may set it, so a
+        # callers.json admits logosctl, read when the module loads.
         run: |
           set -eu
           export LOGOSCTL_CONFIG_DIR="$PWD/session"
           rm -rf "$LOGOSCTL_CONFIG_DIR"; mkdir -p "$LOGOSCTL_CONFIG_DIR" home
-          printf 'modules_dirs: [%s]\n' "$PWD/result-node/modules" | ./logos/bin/logosctl daemon config set - > /dev/null
+          printf 'modules_dirs: [%s]\n' "$PWD/base" | ./logos/bin/logosctl daemon config set - > /dev/null
           HOME="$PWD/home" ./logos/bin/logosctl daemon start --detach
+          trap './logos/bin/logosctl daemon stop > /dev/null 2>&1 || true' EXIT
           ./logos/bin/logosctl module load monero_node_module
+          sleep 1
+          printf '%s\n' '{"allowHost":true}' > "$(ls -d "$LOGOSCTL_CONFIG_DIR"/data/monero_node_module/*/ | head -1)callers.json"
+          ./logos/bin/logosctl module unload monero_node_module; sleep 1
+          ./logos/bin/logosctl module load monero_node_module
+          ./logos/bin/logosctl call monero_node_module tor_use
+          ./logos/bin/logosctl call monero_node_module set_tor_use none
           ./logos/bin/logosctl call monero_node_module init_defaults
           health=$(./logos/bin/logosctl call monero_node_module node_health stagenet)
           case "$health" in
@@ -69,18 +85,72 @@ sections:
         # The daemon wraps a module's reply as a JSON STRING, so the fields inside it arrive
         # escaped: a bare '"reachable":true' matches nothing here.
         expect_contains:
+          - '\"torUse\":\"identifying\",\"torUseChosen\":false'
           - '\"reachable\":true'
           - '\"synced\":true'
+          - '\"torUse\":\"none\"'
+          - '\"route\":\"direct\"'
+
+  - title: "Use Tor for: all, identifying or none"
+    steps:
+      - title: "What a wallet dials in each mode, and the lock while a wallet is open"
+        # identifying gives the onion node with a direct catch-up node beside it; all gives the
+        # onion node alone. Until the built-in Tor is ready the proxy reads `tor`, which a
+        # wallet waits on, and proxyRequired is on, so an older wallet refuses it.
+        run: |
+          set -eu
+          export LOGOSCTL_CONFIG_DIR="$PWD/session"
+          HOME="$PWD/home" ./logos/bin/logosctl daemon start --detach
+          trap './logos/bin/logosctl daemon stop > /dev/null 2>&1 || true' EXIT
+          ./logos/bin/logosctl module load monero_node_module
+          for mode in none identifying all; do
+            ./logos/bin/logosctl call monero_node_module set_tor_use $mode
+            ./logos/bin/logosctl call monero_node_module effective_node stagenet
+          done
+          ./logos/bin/logosctl call monero_node_module set_wallet_open stagenet true
+          ./logos/bin/logosctl call monero_node_module set_tor_use none
+          ./logos/bin/logosctl call monero_node_module set_node_config stagenet 'str:{"url":"http://other:38089"}'
+          ./logos/bin/logosctl call monero_node_module set_wallet_open stagenet false
+          ./logos/bin/logosctl call monero_node_module tor_use
+        expect_contains:
+          - '\"route\":\"direct\",\"source\":\"default\",\"timeoutSecs\":8,\"torUse\":\"none\"'
+          - '\"catchUp\":{\"url\":\"https://node2.monerodevs.org:38089\"}'
+          - '.onion:38089'
+          - '\"proxyRequired\":true'
+          - 'Close your open accounts to change this.'
+          - 'close the wallet before changing its node'
+          - '\"torUse\":\"all\",\"torUseChosen\":true'
+      - title: "node_health over the built-in Tor, through the onion node"
+        # A live join of the Tor network (about 15 s) and an onion service's first answer.
+        run: |
+          set -eu
+          export LOGOSCTL_CONFIG_DIR="$PWD/session"
+          HOME="$PWD/home" ./logos/bin/logosctl daemon start --detach
+          trap './logos/bin/logosctl daemon stop > /dev/null 2>&1 || true' EXIT
+          ./logos/bin/logosctl module load monero_node_module
+          ./logos/bin/logosctl call monero_node_module set_tor_use all
+          for i in $(seq 1 90); do
+            health=$(./logos/bin/logosctl call monero_node_module node_health stagenet)
+            case "$health" in *'\"reachable\":true'*) break;; esac
+            sleep 3
+          done
+          echo "$health"
+        expect_contains:
+          - '\"reachable\":true'
+          - '\"route\":\"proxied\"'
+          - '.onion:38089'
+          - '\"state\":\"ready\"'
 
   - title: "Local mode: dial the node monerod_module runs"
     steps:
       - title: "Without monerod_module, local mode refuses rather than going remote"
-        # monerod_module is an OPTIONAL dependency, so #install stages this module alone.
+        # monerod_module is an OPTIONAL dependency, so #install stages this module alone, and
+        # tor_module is staged beside it. Local mode is direct whatever "Use Tor for" says.
         run: |
           set -eu
           export LOGOSCTL_CONFIG_DIR="$PWD/session-absent"
           rm -rf "$LOGOSCTL_CONFIG_DIR"; mkdir -p "$LOGOSCTL_CONFIG_DIR" home
-          printf 'modules_dirs: [%s]\n' "$PWD/result-node/modules" | ./logos/bin/logosctl daemon config set - > /dev/null
+          printf 'modules_dirs: [%s]\n' "$PWD/base" | ./logos/bin/logosctl daemon config set - > /dev/null
           HOME="$PWD/home" ./logos/bin/logosctl daemon start --detach
           ./logos/bin/logosctl module load monero_node_module
           ./logos/bin/logosctl call monero_node_module init_defaults
@@ -102,7 +172,7 @@ sections:
           set -eu
           nix build 'github:logos-co/logos-monerod-module{release}#install-portable' --no-write-lock-file -o result-monerod
           rm -rf tree; mkdir -p tree
-          cp -rL result-node/modules/* result-monerod/modules/* tree/
+          cp -rL base/* result-monerod/modules/* tree/
           chmod -R u+w tree
           export LOGOSCTL_CONFIG_DIR="$PWD/session-present"
           rm -rf "$LOGOSCTL_CONFIG_DIR"; mkdir -p "$LOGOSCTL_CONFIG_DIR" home

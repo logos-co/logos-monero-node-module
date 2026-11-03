@@ -8,15 +8,21 @@
 //!
 //! A network in `local` mode dials the node `monerod_module` runs in-process instead of its
 //! stored `url`, through the [`LocalNode`] seam.
+//!
+//! "Use Tor for" ([`TorUse`]) decides the route: `url` is the direct node, `onionUrl` the node
+//! over Tor, and [`Nodes::plan`] picks between them. Tor routes never fall back to direct.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::proxy::{build_client, ProxyConfig};
+use crate::tor::{is_onion, is_own_network, normalize_proxy, TorSettings, TorUse, TorView, BUILT_IN};
 
 /// The networks a wallet may talk to. Fixed set: a monerod is one of these, and an
 /// unrecognised name is a configuration error, not a new network.
@@ -32,6 +38,9 @@ fn default_timeout() -> u64 {
     8
 }
 
+/// An onion service often takes 10-15 s to answer a first request.
+const TOR_TIMEOUT: u64 = 15;
+
 /// Where a network's calls go: its stored `url`, or the node `monerod_module` runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -44,13 +53,19 @@ pub enum NodeMode {
 /// One network's transport config. camelCase on the wire to match `chains.json` conventions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeConfig {
+    /// The direct node: everything in `none`, the catch-up in `identifying`.
     pub url: String,
+    /// The node over Tor, in `all` and after the catch-up in `identifying`. Empty: `url` over Tor.
+    #[serde(default, rename = "onionUrl", skip_serializing_if = "Option::is_none")]
+    pub onion_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// Which Tor: empty or `tor` is the one that comes with Logos, else your own `socks5h://`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+    /// From before "Use Tor for": read only to migrate. Tor routes are always fail-closed.
     #[serde(default, rename = "proxyRequired")]
     pub proxy_required: bool,
     #[serde(default = "default_timeout", rename = "timeoutSecs")]
@@ -71,8 +86,21 @@ fn source_default() -> String { "external".into() }
 
 impl NodeConfig {
     fn proxy_cfg(&self) -> ProxyConfig {
+        // monerod serves TLS with a certificate it made itself; wallet2 never checks it either.
         ProxyConfig::new(self.proxy.clone(), self.proxy_required, self.timeout_secs)
+            .accept_self_signed(self.url.starts_with("https://"))
     }
+}
+
+/// Where one network's calls go under the current "Use Tor for".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Plan {
+    pub cfg: NodeConfig,
+    pub tor_use: TorUse,
+    pub url: String,
+    pub via_tor: bool,
+    /// `identifying`: the node a wallet catches up from directly before it moves to `url`.
+    pub catch_up: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -91,6 +119,12 @@ pub enum NodeError {
     Parse(String),
     #[error("local node: {0}")]
     Local(String),
+    #[error("{0}")]
+    Locked(String),
+    #[error("{0}")]
+    TorNotReady(String),
+    #[error("this node is an onion service, reachable only over Tor, and Use Tor for is Nothing")]
+    TorOff,
 }
 
 type Result<T> = std::result::Result<T, NodeError>;
@@ -108,6 +142,13 @@ pub struct Nodes {
     map: BTreeMap<String, NodeConfig>,
     path: Option<PathBuf>,
     local: Option<Box<dyn LocalNode>>,
+    tor_settings: TorSettings,
+    /// The built-in Tor as tor_module last answered, written by the glue.
+    tor: Arc<Mutex<Option<TorView>>>,
+    /// A wallet asked for a route through the built-in Tor, so following it may start it.
+    asked: Arc<AtomicBool>,
+    /// Networks the wallet engine has a wallet open on: their settings are locked.
+    wallet_open: BTreeSet<String>,
 }
 
 impl Nodes {
@@ -117,7 +158,44 @@ impl Nodes {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str::<BTreeMap<String, NodeConfig>>(&s).ok())
             .unwrap_or_default();
-        Self { map, path, local: None }
+        let saved = path.as_deref().and_then(|p| TorSettings::load(&TorSettings::path_beside(p)));
+        let tor_settings = saved.clone().unwrap_or_else(|| {
+            if map.is_empty() {
+                TorSettings::fresh()
+            } else {
+                TorSettings::migrated(map.values().any(|c| c.proxy_required || c.proxy.as_deref().is_some_and(|p| !p.trim().is_empty())))
+            }
+        });
+        let mut n = Self { map, path, local: None, tor_settings, tor: Arc::default(), asked: Arc::default(), wallet_open: BTreeSet::new() };
+        if saved.is_none() {
+            let _ = n.persist_tor();
+        }
+        if n.upgrade_defaults() {
+            let _ = n.persist();
+        }
+        n
+    }
+
+    /// Moves records the module seeded onto today's defaults: TLS, and an onion node for Tor.
+    fn upgrade_defaults(&mut self) -> bool {
+        let mut changed = false;
+        for (net, c) in self.map.iter_mut().filter(|(_, c)| c.source == "default") {
+            let Some(d) = DEFAULT_ENDPOINTS.iter().find(|d| d.0 == net) else { continue };
+            if OLD_DEFAULT_URLS.contains(&c.url.as_str()) && c.url != d.1 {
+                c.url = d.1.into();
+                changed = true;
+            }
+            if c.onion_url.is_none() && !d.2.is_empty() {
+                c.onion_url = Some(d.2.into());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn persist_tor(&self) -> Result<()> {
+        let Some(p) = self.path.as_ref() else { return Ok(()) };
+        self.tor_settings.save(&TorSettings::path_beside(p)).map_err(|e| NodeError::Http(e.to_string()))
     }
 
     pub fn with_local(mut self, local: Box<dyn LocalNode>) -> Self {
@@ -154,10 +232,18 @@ impl Nodes {
         if !is_network(network) {
             return Err(NodeError::UnknownNetwork(network.into()));
         }
+        if self.wallet_open.contains(network) {
+            return Err(NodeError::Locked("close the wallet before changing its node".into()));
+        }
         if cfg.mode == NodeMode::Local && network == "regtest" {
             return Err(NodeError::Local("not available on regtest".into()));
         }
         cfg.url = normalise_url(&cfg.url);
+        cfg.onion_url = cfg.onion_url.map(|u| normalise_url(&u)).filter(|u| !u.is_empty());
+        cfg.proxy = match normalize_proxy(cfg.proxy.as_deref()).map_err(NodeError::Proxy)? {
+            p if p == BUILT_IN => None,
+            own => Some(own),
+        };
         self.map.insert(network.into(), cfg);
         self.persist()
     }
@@ -173,11 +259,12 @@ impl Nodes {
     /// Returns the list of `(network, field)` pairs it actually seeded.
     pub fn init_defaults(&mut self) -> Result<Vec<String>> {
         let mut applied = Vec::new();
-        for (net, url, trusted) in DEFAULT_ENDPOINTS {
+        for (net, url, onion, trusted) in DEFAULT_ENDPOINTS {
             let entry = self.map.entry((*net).into()).or_insert_with(|| {
                 applied.push(format!("{net}.endpoint"));
                 NodeConfig {
                     url: (*url).into(),
+                    onion_url: (!onion.is_empty()).then(|| (*onion).into()),
                     username: None,
                     password: None,
                     proxy: None,
@@ -217,28 +304,115 @@ impl Nodes {
         json!({ "ok": true, "state": state, "source": source, "networks": self.list() })
     }
 
-    /// The config a call actually uses. In local mode: the local node's loopback URL, trusted,
-    /// with no proxy or credentials, so a required proxy cannot fail-close a loopback call. The
-    /// stored remote fields stay on the record for a switch back. Never falls back to remote.
-    pub fn effective(&self, network: &str) -> Result<NodeConfig> {
+    /// Where `network`'s calls go. Local mode and your own network are direct in every mode; an
+    /// onion service is Tor-only; in `identifying` a wallet first catches up from `url` directly.
+    pub fn plan(&self, network: &str) -> Result<Plan> {
         let c = self.get(network).ok_or_else(|| NodeError::NotConfigured(network.into()))?;
-        if c.mode == NodeMode::Remote {
-            return Ok(c.clone());
+        let tor_use = self.tor_settings.tor_use;
+        let direct = |url: String| Plan { cfg: c.clone(), tor_use, url, via_tor: false, catch_up: None };
+        if c.mode == NodeMode::Local {
+            let local = self.local.as_ref()
+                .ok_or_else(|| NodeError::Local("monerod_module is not available".into()))?;
+            let url = local.rpc_url(network).map_err(NodeError::Local)?;
+            if url.is_empty() {
+                return Err(NodeError::Local(format!("no local node for {network}")));
+            }
+            return Ok(direct(url));
         }
-        let local = self.local.as_ref()
-            .ok_or_else(|| NodeError::Local("monerod_module is not available".into()))?;
-        let url = local.rpc_url(network).map_err(NodeError::Local)?;
-        if url.is_empty() {
-            return Err(NodeError::Local(format!("no local node for {network}")));
+        if tor_use == TorUse::None {
+            if is_onion(&c.url) {
+                return Err(NodeError::TorOff);
+            }
+            return Ok(direct(c.url.clone()));
         }
+        let target = c.onion_url.clone().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| c.url.clone());
+        if is_own_network(&target) {
+            return Ok(direct(target));
+        }
+        // The same node on both sides would see the catch-up and the sends together.
+        let catch_up = (tor_use == TorUse::Identifying && !is_onion(&c.url) && c.url != target).then(|| c.url.clone());
+        Ok(Plan { cfg: c.clone(), tor_use, url: target, via_tor: true, catch_up })
+    }
+
+    /// The SOCKS proxy for a Tor route: your own, or the built-in Tor once it is ready.
+    fn socks(&self, cfg: &NodeConfig) -> Result<String> {
+        let p = normalize_proxy(cfg.proxy.as_deref()).map_err(NodeError::Proxy)?;
+        if p != BUILT_IN {
+            return Ok(p);
+        }
+        self.asked.store(true, Ordering::Relaxed);
+        match self.tor.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(v) if v.usable_socks().is_some() => Ok(v.usable_socks().unwrap().to_string()),
+            Some(v) if v.state == "ready" => Err(NodeError::TorNotReady("the Tor SOCKS port is off; turn it on in the Tor app".into())),
+            Some(v) if v.state == "failed" && !v.answered => Err(NodeError::TorNotReady(format!("Tor is not available: {}", v.detail))),
+            Some(v) => Err(NodeError::TorNotReady(format!("waiting for Tor ({}, {}%)", v.state, v.progress))),
+            None => Err(NodeError::TorNotReady("waiting for Tor".into())),
+        }
+    }
+
+    /// What a wallet dials: `{ url, proxy, proxyRequired, trusted, torUse, route, catchUp? }`.
+    /// A Tor route the built-in Tor cannot carry yet has proxy `tor`, so the wallet waits for it.
+    /// proxyRequired is set on every Tor route, so an older engine fails closed on it.
+    pub fn effective(&self, network: &str) -> Result<Value> {
+        let plan = self.plan(network)?;
+        let c = &plan.cfg;
+        let same = plan.url == c.url;
+        let local = c.mode == NodeMode::Local;
+        let (proxy, tor_ready) = if plan.via_tor {
+            match self.socks(c) {
+                Ok(p) => (Some(p), true),
+                Err(NodeError::TorNotReady(_)) => (Some(BUILT_IN.to_string()), false),
+                Err(e) => return Err(e),
+            }
+        } else {
+            (None, false)
+        };
+        // No `proxy` key on a direct route: an older engine reads it as a string, never null.
+        let mut v = json!({
+            "url": plan.url,
+            "proxyRequired": plan.via_tor,
+            "trusted": local || (same && c.trusted && !plan.via_tor),
+            "timeoutSecs": c.timeout_secs,
+            "source": c.source,
+            "mode": c.mode,
+            "torUse": plan.tor_use,
+            "route": if plan.via_tor { "proxied" } else { "direct" },
+        });
+        if let Some(p) = proxy {
+            v["proxy"] = json!(p);
+            v["torReady"] = json!(tor_ready);
+        }
+        if same && !local {
+            if let Some(u) = &c.username { v["username"] = json!(u); }
+            if let Some(p) = &c.password { v["password"] = json!(p); }
+        }
+        if let Some(u) = &plan.catch_up {
+            v["catchUp"] = json!({ "url": u });
+        }
+        Ok(v)
+    }
+
+    /// The transport for this module's own calls: the plan's node, over Tor when it says so.
+    fn dial(&self, network: &str) -> Result<NodeConfig> {
+        let plan = self.plan(network)?;
+        let c = &plan.cfg;
+        let same = plan.url == c.url;
+        let via_tor = plan.via_tor;
         Ok(NodeConfig {
-            url, username: None, password: None, proxy: None, proxy_required: false,
-            timeout_secs: c.timeout_secs, trusted: true, source: c.source.clone(), mode: NodeMode::Local,
+            proxy: if via_tor { Some(self.socks(c)?) } else { None },
+            proxy_required: via_tor,
+            timeout_secs: if via_tor { c.timeout_secs.max(TOR_TIMEOUT) } else { c.timeout_secs },
+            username: c.username.clone().filter(|_| same && c.mode == NodeMode::Remote),
+            password: c.password.clone().filter(|_| same && c.mode == NodeMode::Remote),
+            trusted: c.mode == NodeMode::Local || (same && c.trusted && !via_tor),
+            onion_url: None,
+            url: plan.url,
+            ..c.clone()
         })
     }
 
     fn client(&self, network: &str) -> Result<(reqwest::blocking::Client, NodeConfig)> {
-        let c = self.effective(network)?;
+        let c = self.dial(network)?;
         let client = build_client(&c.proxy_cfg()).map_err(|e| NodeError::Proxy(e.to_string()))?;
         Ok((client, c))
     }
@@ -328,8 +502,10 @@ impl Nodes {
         }
         let mode = self.get(network).map(|c| c.mode).unwrap_or_default();
         if mode == NodeMode::Remote {
-            let mut h = self.dial_health(network);
+            let mut h = self.remote_health(network);
             h["mode"] = json!(mode);
+            h["torUse"] = json!(self.tor_settings.tor_use);
+            h["torUseChosen"] = json!(self.tor_settings.chosen);
             return h;
         }
         // Ask the local node first: when it is absent that one bounded call is the whole cost,
@@ -343,7 +519,93 @@ impl Nodes {
         };
         h["mode"] = json!(mode);
         h["local"] = local;
+        h["torUse"] = json!(self.tor_settings.tor_use);
+        h["torUseChosen"] = json!(self.tor_settings.chosen);
         h
+    }
+
+    /// Health of the plan's node. A Tor route is not dialled until Tor can carry it, and a
+    /// health poll alone never starts the built-in Tor.
+    fn remote_health(&self, network: &str) -> Value {
+        let plan = match self.plan(network) {
+            Ok(p) => p,
+            Err(e) => return json!({ "ok": true, "reachable": false, "error": e.to_string() }),
+        };
+        if !plan.via_tor {
+            return self.dial_health(network);
+        }
+        let built_in = normalize_proxy(plan.cfg.proxy.as_deref()).is_ok_and(|p| p == BUILT_IN);
+        let view = self.tor.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut h = if built_in && !view.as_ref().is_some_and(|v| v.usable_socks().is_some()) {
+            let why = match &view {
+                None => "Tor has not started yet".to_string(),
+                Some(v) if v.state == "ready" => "the Tor SOCKS port is off".to_string(),
+                Some(v) => format!("waiting for Tor ({}, {}%)", v.state, v.progress),
+            };
+            json!({ "ok": true, "reachable": false, "error": why, "route": "proxied" })
+        } else {
+            self.dial_health(network)
+        };
+        h["url"] = json!(plan.url);
+        if let Some(u) = &plan.catch_up {
+            h["catchUp"] = json!({ "url": u });
+        }
+        if built_in {
+            h["tor"] = view.map(|v| v.json()).unwrap_or(json!({ "state": "idle", "answered": false }));
+        }
+        h
+    }
+
+    // ── Use Tor for ───────────────────────────────────────────────────────────
+
+    /// `{ ok, torUse, torUseChosen, existing }`.
+    pub fn tor_use(&self) -> Value {
+        let mut v = self.tor_settings.json();
+        v["ok"] = json!(true);
+        v
+    }
+
+    /// Stores the user's choice. Refused while any wallet is open: it binds its node at open.
+    pub fn set_tor_use(&mut self, mode: &str) -> Result<Value> {
+        let tor_use = TorUse::parse(mode).ok_or_else(|| NodeError::Parse(format!("unknown mode: {mode} (all, identifying or none)")))?;
+        if !self.wallet_open.is_empty() {
+            return Err(NodeError::Locked("Close your open accounts to change this.".into()));
+        }
+        let before = self.tor_settings.clone();
+        self.tor_settings.tor_use = tor_use;
+        self.tor_settings.chosen = true;
+        if let Err(e) = self.persist_tor() {
+            self.tor_settings = before;
+            return Err(e);
+        }
+        Ok(self.tor_use())
+    }
+
+    /// The wallet engine says a wallet opened or closed on `network`.
+    pub fn set_wallet_open(&mut self, network: &str, open: bool) -> Result<Value> {
+        if !is_network(network) {
+            return Err(NodeError::UnknownNetwork(network.into()));
+        }
+        if open { self.wallet_open.insert(network.into()); } else { self.wallet_open.remove(network); }
+        Ok(json!({ "ok": true, "network": network, "walletOpen": open }))
+    }
+
+    /// Whether `network` goes through the built-in Tor, so tor_module's status is needed.
+    /// Local mode never does, and is skipped first: resolving it is an IPC call.
+    pub fn wants_tor(&self, network: &str) -> bool {
+        self.get(network).is_some_and(|c| c.mode == NodeMode::Remote)
+            && self.plan(network).is_ok_and(|p| p.via_tor && normalize_proxy(p.cfg.proxy.as_deref()).is_ok_and(|x| x == BUILT_IN))
+    }
+
+    /// Whether a health poll may ask tor_module: once the user chose, or a wallet asked for Tor.
+    /// Asking starts Tor, and a poll alone must not start it before the first-run choice.
+    pub fn follows_tor(&self) -> bool {
+        self.tor_settings.chosen || self.asked.load(Ordering::Relaxed)
+    }
+
+    /// Where the glue writes tor_module's status, without the registry's lock.
+    pub fn tor_handle(&self) -> Arc<Mutex<Option<TorView>>> {
+        self.tor.clone()
     }
 
     /// `{ ok, available, rpcUrl, status }`, whatever mode `network` is in: whether a settings UI
@@ -409,12 +671,20 @@ fn normalise_url(url: &str) -> String {
 /// `set_node_config` is the answer, and the wallet's Wallets screen exposes it. Deliberately no
 /// automatic failover: on a privacy coin, silently moving a user's queries to a different
 /// operator is not a convenience.
-/// (network, url, trusted)
-pub const DEFAULT_ENDPOINTS: &[(&str, &str, bool)] = &[
-    ("mainnet",  "http://node.monerodevs.org:18089",  false),
-    ("stagenet", "http://node2.monerodevs.org:38089", false),
-    ("testnet",  "http://node.monerodevs.org:28089",  false),
-    ("regtest",  "http://127.0.0.1:18081",            true),
+///
+/// The direct node speaks TLS (monerod's own certificate); the node over Tor is an onion
+/// service from Feather's list, run by someone other than the direct node's operator.
+/// (network, url, onionUrl, trusted)
+pub const DEFAULT_ENDPOINTS: &[(&str, &str, &str, bool)] = &[
+    ("mainnet",  "https://node.monerodevs.org:18089",  "http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:18089", false),
+    ("stagenet", "https://node2.monerodevs.org:38089", "http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:38089", false),
+    ("testnet",  "https://node.monerodevs.org:28089",  "http://plowsoffjexmxalw73tkjmf422gq6575fc7vicuu4javzn2ynnte6tyd.onion:28089", false),
+    ("regtest",  "http://127.0.0.1:18081",             "", true),
+];
+
+/// Plain-http defaults earlier builds seeded; a record still on one moves to TLS.
+const OLD_DEFAULT_URLS: &[&str] = &[
+    "http://node.monerodevs.org:18089", "http://node2.monerodevs.org:38089", "http://node.monerodevs.org:28089",
 ];
 
 #[cfg(test)]
@@ -433,9 +703,26 @@ mod tests {
     }
 
     fn cfg(url: &str) -> NodeConfig {
-        NodeConfig { url: url.into(), username: None, password: None, proxy: None,
+        NodeConfig { url: url.into(), onion_url: None, username: None, password: None, proxy: None,
                      proxy_required: false, timeout_secs: 8, trusted: false, source: "external".into(),
                      mode: NodeMode::Remote }
+    }
+
+    fn with_mode(mode: &str) -> Nodes {
+        let mut n = Nodes::new(None);
+        n.set_tor_use(mode).unwrap();
+        n
+    }
+
+    fn ready_tor(n: &Nodes) {
+        *n.tor_handle().lock().unwrap() = Some(TorView::from_reply(Ok(
+            r#"{"ok":true,"state":"ready","progress":100,"socks":"socks5h://127.0.0.1:9250"}"#.into())));
+    }
+
+    const ONION: &str = "http://abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv.onion:38089";
+
+    fn both(url: &str) -> NodeConfig {
+        NodeConfig { onion_url: Some(ONION.into()), ..cfg(url) }
     }
 
     #[test]
@@ -476,18 +763,168 @@ mod tests {
 
     #[test]
     fn proxy_required_without_proxy_fails_closed() {
-        let mut n = Nodes::new(None);
-        let mut c = cfg("http://node:18089");
-        c.proxy_required = true;
+        // A Tor route while the built-in Tor cannot carry traffic: refuse, never go direct.
+        for mode in ["all", "identifying"] {
+            let mut n = with_mode(mode);
+            n.set("stagenet", both("http://node:18089")).unwrap();
+            let r = n.get_info("stagenet");
+            assert!(matches!(r, Err(NodeError::TorNotReady(_))), "{mode}: got {r:?}");
+            let e = n.effective("stagenet").unwrap();
+            assert_eq!((&e["proxy"], &e["proxyRequired"], &e["torReady"]), (&json!("tor"), &json!(true), &json!(false)));
+        }
+        // The SOCKS port off is the same refusal, with the reason.
+        let mut n = with_mode("all");
+        n.set("stagenet", both("http://node:18089")).unwrap();
+        *n.tor_handle().lock().unwrap() = Some(TorView::from_reply(Ok(r#"{"ok":true,"state":"ready","socks":null}"#.into())));
+        assert!(matches!(n.get_info("stagenet"), Err(NodeError::TorNotReady(e)) if e.contains("SOCKS port is off")));
+    }
+
+    #[test]
+    fn each_mode_routes_the_wallet_where_it_says() {
+        let mut n = with_mode("none");
+        n.set("stagenet", both("https://clear.example:38089")).unwrap();
+        let e = n.effective("stagenet").unwrap();
+        assert_eq!((&e["url"], &e["proxyRequired"]), (&json!("https://clear.example:38089"), &json!(false)));
+        assert!(e.get("proxy").is_none() && e.get("catchUp").is_none() && !n.wants_tor("stagenet"));
+
+        n.set_tor_use("all").unwrap();
+        ready_tor(&n);
+        let e = n.effective("stagenet").unwrap();
+        assert_eq!((&e["url"], &e["proxy"], &e["proxyRequired"]), (&json!(ONION), &json!("socks5h://127.0.0.1:9250"), &json!(true)));
+        assert!(e.get("catchUp").is_none() && n.wants_tor("stagenet"));
+
+        n.set_tor_use("identifying").unwrap();
+        let e = n.effective("stagenet").unwrap();
+        assert_eq!((&e["url"], &e["catchUp"]["url"], &e["torUse"]), (&json!(ONION), &json!("https://clear.example:38089"), &json!("identifying")));
+    }
+
+    #[test]
+    fn onion_and_own_network_keep_their_route_in_every_mode() {
+        // An onion service is reachable only over Tor: refused in none, never a catch-up.
+        let mut n = with_mode("none");
+        n.set("stagenet", cfg(ONION)).unwrap();
+        assert!(matches!(n.effective("stagenet"), Err(NodeError::TorOff)));
+        n.set_tor_use("identifying").unwrap();
+        let e = n.effective("stagenet").unwrap();
+        assert_eq!((&e["url"], &e["proxyRequired"]), (&json!(ONION), &json!(true)));
+        assert!(e.get("catchUp").is_none());
+        // This computer or its network: direct, and trusted only there.
+        for mode in ["all", "identifying", "none"] {
+            n.set_tor_use(mode).unwrap();
+            let mut c = cfg("http://192.168.1.4:38081");
+            c.trusted = true;
+            n.set("stagenet", c).unwrap();
+            let e = n.effective("stagenet").unwrap();
+            assert_eq!((&e["proxy"], &e["proxyRequired"], &e["trusted"]), (&json!(null), &json!(false), &json!(true)), "{mode}");
+        }
+    }
+
+    #[test]
+    fn one_node_for_both_halves_means_no_catch_up_and_no_credentials_over_tor() {
+        let mut n = with_mode("identifying");
+        ready_tor(&n);
+        // No onion node: the same node over Tor throughout, as a catch-up would tie the two together.
+        n.set("stagenet", cfg("https://clear.example:38089")).unwrap();
+        let e = n.effective("stagenet").unwrap();
+        assert_eq!(e["url"], "https://clear.example:38089");
+        assert!(e.get("catchUp").is_none());
+        // The direct node's login is not sent to the onion node, nor trust carried over.
+        let mut c = both("https://clear.example:38089");
+        c.username = Some("u".into());
+        c.password = Some("p".into());
+        c.trusted = true;
         n.set("stagenet", c).unwrap();
-        // Any call must refuse rather than build a clear-net client.
-        let r = n.get_info("stagenet");
-        assert!(matches!(r, Err(NodeError::Proxy(_))), "got {r:?}");
+        let e = n.effective("stagenet").unwrap();
+        assert!(e.get("username").is_none() && e.get("password").is_none());
+        assert_eq!(e["trusted"], false);
+    }
+
+    #[test]
+    fn your_own_tor_is_used_as_it_is_and_never_asks_the_built_in_one() {
+        let mut n = with_mode("all");
+        let mut c = both("https://clear.example:38089");
+        c.proxy = Some("socks5://127.0.0.1:9050".into());
+        n.set("stagenet", c).unwrap();
+        assert_eq!(n.get("stagenet").unwrap().proxy.as_deref(), Some("socks5h://127.0.0.1:9050"));
+        assert_eq!(n.effective("stagenet").unwrap()["proxy"], "socks5h://127.0.0.1:9050");
+        assert!(!n.wants_tor("stagenet"));
+        let mut bad = cfg("http://x:1");
+        bad.proxy = Some("http://127.0.0.1:8118".into());
+        assert!(matches!(n.set("stagenet", bad), Err(NodeError::Proxy(_))));
+    }
+
+    #[test]
+    fn a_health_poll_follows_tor_only_once_chosen_or_asked() {
+        let mut n = Nodes::new(None);
+        n.set("stagenet", both("https://clear.example:38089")).unwrap();
+        assert!(n.wants_tor("stagenet") && !n.follows_tor());
+        let h = n.node_health("stagenet");
+        assert_eq!((&h["reachable"], &h["torUseChosen"]), (&json!(false), &json!(false)));
+        assert_eq!(h["tor"]["state"], "idle");
+        let _ = n.effective("stagenet");
+        assert!(n.follows_tor(), "a wallet asked for the Tor route");
+        assert!(with_mode("identifying").follows_tor());
+    }
+
+    #[test]
+    fn settings_are_locked_while_a_wallet_is_open() {
+        let mut n = with_mode("identifying");
+        n.set("stagenet", both("https://clear.example:38089")).unwrap();
+        n.set_wallet_open("stagenet", true).unwrap();
+        assert!(matches!(n.set_tor_use("none"), Err(NodeError::Locked(_))));
+        assert!(matches!(n.set("stagenet", cfg("http://other:1")), Err(NodeError::Locked(_))));
+        n.set("mainnet", cfg("https://other.example:18089")).unwrap();
+        n.set_wallet_open("stagenet", false).unwrap();
+        assert_eq!(n.set_tor_use("none").unwrap()["torUse"], "none");
+        assert!(n.set_tor_use("some").is_err());
+    }
+
+    #[test]
+    fn a_fresh_install_asks_and_an_existing_one_keeps_its_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("monero_nodes.json");
+        let fresh = Nodes::new(Some(p.clone()));
+        assert_eq!(fresh.tor_use(), json!({ "ok": true, "torUse": "identifying", "torUseChosen": false, "existing": false }));
+        std::fs::remove_file(dir.path().join("monero_tor.json")).unwrap();
+
+        for (record, mode) in [
+            (r#"{"stagenet":{"url":"http://n:38089","proxy":"socks5h://127.0.0.1:9050","proxyRequired":true}}"#, "all"),
+            (r#"{"stagenet":{"url":"http://n:38089","proxyRequired":true}}"#, "all"),
+            (r#"{"stagenet":{"url":"http://n:38089"}}"#, "none"),
+        ] {
+            std::fs::write(&p, record).unwrap();
+            let _ = std::fs::remove_file(dir.path().join("monero_tor.json"));
+            let n = Nodes::new(Some(p.clone()));
+            assert_eq!(n.tor_use(), json!({ "ok": true, "torUse": mode, "torUseChosen": false, "existing": true }), "{record}");
+            // Stored at once, so a later load does not migrate again.
+            let mut n = Nodes::new(Some(p.clone()));
+            n.set_tor_use("identifying").unwrap();
+            assert_eq!(Nodes::new(Some(p.clone())).tor_use()["torUseChosen"], true);
+        }
+    }
+
+    #[test]
+    fn seeded_defaults_move_to_tls_and_gain_an_onion_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("monero_nodes.json");
+        std::fs::write(&p, r#"{"stagenet":{"url":"http://node2.monerodevs.org:38089","source":"default"},
+                              "mainnet":{"url":"http://node.monerodevs.org:18089","source":"external"}}"#).unwrap();
+        let n = Nodes::new(Some(p.clone()));
+        let s = n.get("stagenet").unwrap();
+        assert_eq!(s.url, "https://node2.monerodevs.org:38089");
+        assert!(s.onion_url.as_deref().is_some_and(|u| u.ends_with(".onion:38089")));
+        // A node the user picked stays exactly as it was.
+        let m = n.get("mainnet").unwrap();
+        assert_eq!((m.url.as_str(), m.onion_url.is_none()), ("http://node.monerodevs.org:18089", true));
+        assert_eq!(Nodes::new(Some(p)).get("stagenet").unwrap().url, "https://node2.monerodevs.org:38089");
+        for (_, url, onion, _) in DEFAULT_ENDPOINTS {
+            assert!(onion.is_empty() || (is_onion(onion) && !is_onion(url) && url.starts_with("https://")), "{url}");
+        }
     }
 
     #[test]
     fn health_of_unreachable_node_reports_rather_than_errors() {
-        let mut n = Nodes::new(None);
+        let mut n = with_mode("none");
         // Reserved-TEST-net address, no server: connect fails fast under the 8s timeout.
         n.set("regtest", cfg("http://192.0.2.1:18081")).unwrap();
         let h = n.node_health("regtest");
@@ -528,14 +965,17 @@ mod tests {
 
     #[test]
     fn remote_mode_dials_the_stored_record_even_with_a_local_node() {
-        let mut n = Nodes::new(None).with_local(Box::new(FakeLocal("http://127.0.0.1:38081")));
-        n.set("stagenet", cfg("http://node2:38089")).unwrap();
-        assert_eq!(&n.effective("stagenet").unwrap(), n.get("stagenet").unwrap());
+        let mut n = with_mode("none").with_local(Box::new(FakeLocal("http://127.0.0.1:38081")));
+        let mut c = cfg("http://node2:38089");
+        c.username = Some("u".into());
+        n.set("stagenet", c).unwrap();
+        let e = n.effective("stagenet").unwrap();
+        assert_eq!((&e["url"], &e["mode"], &e["username"]), (&json!("http://node2:38089"), &json!("remote"), &json!("u")));
     }
 
     #[test]
     fn local_mode_dials_loopback_trusted_unproxied_and_keeps_the_remote_half() {
-        let mut n = Nodes::new(None).with_local(Box::new(FakeLocal("http://127.0.0.1:38081")));
+        let mut n = with_mode("all").with_local(Box::new(FakeLocal("http://127.0.0.1:38081")));
         let mut c = local("http://node2:38089");
         c.proxy = Some("socks5h://127.0.0.1:9050".into());
         c.proxy_required = true;
@@ -543,10 +983,12 @@ mod tests {
         c.password = Some("p".into());
         n.set("stagenet", c.clone()).unwrap();
         let e = n.effective("stagenet").unwrap();
-        assert_eq!(e.url, "http://127.0.0.1:38081");
-        assert!(e.trusted);
-        assert_eq!((e.proxy, e.proxy_required, e.username, e.password), (None, false, None, None));
+        assert_eq!(e["url"], "http://127.0.0.1:38081");
+        assert_eq!(e["trusted"], true);
+        assert_eq!((&e["proxy"], &e["proxyRequired"]), (&json!(null), &json!(false)));
+        assert!(e.get("username").is_none() && e.get("password").is_none());
         assert_eq!(n.get("stagenet").unwrap(), &c);
+        assert!(!n.wants_tor("stagenet"));
     }
 
     #[test]
