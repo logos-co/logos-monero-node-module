@@ -201,6 +201,8 @@ impl Job {
             trusted: false,
             source: "default".into(),
             mode: crate::node::NodeMode::Remote,
+            own: false,
+            reach_through_tor: true,
         }
     }
 }

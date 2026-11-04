@@ -13,6 +13,9 @@
 //! over Tor, and [`Nodes::plan`] picks between them. Tor routes never fall back to direct.
 //!
 //! A mainnet record the module seeded moves among the public nodes [`crate::pick`] lists, by health.
+//!
+//! A node you run (`own`) is routed by its address alone: your network direct, an onion over Tor,
+//! anywhere else by `reachThroughTor`. "Use Tor for" does not apply to it, and it is never moved.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -77,15 +80,22 @@ pub struct NodeConfig {
     /// that leak on an untrusted daemon). Advisory here — the wallet module enforces it.
     #[serde(default)]
     pub trusted: bool,
-    /// "default" (seeded by init_defaults) or "external" (a UI wrote it).
+    /// "default": the node this module seeds and picks by health. Anything else is stored "external".
     #[serde(default = "source_default")]
     pub source: String,
     /// Absent from configs written before local mode existed, so those stay remote.
     #[serde(default)]
     pub mode: NodeMode,
+    /// A node you run, at `url`: routed by its address, never by "Use Tor for".
+    #[serde(default)]
+    pub own: bool,
+    /// Your own node at an internet address goes through Tor unless this is off.
+    #[serde(default = "yes", rename = "reachThroughTor")]
+    pub reach_through_tor: bool,
 }
 
 fn source_default() -> String { "external".into() }
+fn yes() -> bool { true }
 
 impl NodeConfig {
     pub(crate) fn proxy_cfg(&self) -> ProxyConfig {
@@ -192,8 +202,15 @@ impl Nodes {
     }
 
     /// Moves records the module seeded onto today's defaults: TLS, and an onion node for Tor.
+    /// A node you set on your own network is yours: it was direct in every mode, and stays so.
     fn upgrade_defaults(&mut self) -> bool {
         let mut changed = false;
+        for c in self.map.values_mut().filter(|c| c.source != "default" && c.mode == NodeMode::Remote && !c.own) {
+            if is_own_network(&c.url) {
+                c.own = true;
+                changed = true;
+            }
+        }
         for (net, c) in self.map.iter_mut().filter(|(_, c)| c.source == "default") {
             let Some(d) = DEFAULT_ENDPOINTS.iter().find(|d| d.0 == net) else { continue };
             if OLD_DEFAULT_URLS.contains(&c.url.as_str()) && c.url != d.1 {
@@ -244,6 +261,9 @@ impl Nodes {
     /// a schemeless `host:port` — which is exactly what the wallet's own field used to ask for —
     /// produces `host:port/json_rpc`, and reqwest rejects that as having no base. Storing it
     /// verbatim turned a typo-shaped input into an obscure transport error much later.
+    ///
+    /// `source: "default"` asks for the node the module picks: the stored seeded pair if there is
+    /// one, else the seed, and its address fields are not the caller's. Any other record is yours.
     pub fn set(&mut self, network: &str, mut cfg: NodeConfig) -> Result<()> {
         if !is_network(network) {
             return Err(NodeError::UnknownNetwork(network.into()));
@@ -254,12 +274,27 @@ impl Nodes {
         if cfg.mode == NodeMode::Local && network == "regtest" {
             return Err(NodeError::Local("not available on regtest".into()));
         }
-        cfg.url = normalise_url(&cfg.url);
-        cfg.onion_url = cfg.onion_url.map(|u| normalise_url(&u)).filter(|u| !u.is_empty());
         cfg.proxy = match normalize_proxy(cfg.proxy.as_deref()).map_err(NodeError::Proxy)? {
             p if p == BUILT_IN => None,
             own => Some(own),
         };
+        let was_seeded = self.map.get(network).is_some_and(|c| c.source == "default");
+        if cfg.source == "default" && !cfg.own {
+            let seeded = self.map.get(network).filter(|_| was_seeded).map(|c| (c.url.clone(), c.onion_url.clone(), c.trusted));
+            let (url, onion, trusted) = seeded.or_else(|| DEFAULT_ENDPOINTS.iter().find(|d| d.0 == network)
+                .map(|d| (d.1.to_string(), (!d.2.is_empty()).then(|| d.2.to_string()), d.3)))
+                .ok_or_else(|| NodeError::NotConfigured(network.into()))?;
+            cfg = NodeConfig { url, onion_url: onion, username: None, password: None, trusted, reach_through_tor: true, ..cfg };
+            if !was_seeded {
+                // A pick made before the record was yours says nothing about the seed.
+                self.checks.lock().unwrap_or_else(|e| e.into_inner()).retain(|(n, _), _| n != network);
+            }
+        } else {
+            cfg.source = "external".into();
+            cfg.url = normalise_url(&cfg.url);
+            cfg.onion_url = cfg.onion_url.map(|u| normalise_url(&u)).filter(|u| !u.is_empty());
+            cfg.own |= cfg.mode == NodeMode::Remote && is_own_network(&cfg.url);
+        }
         self.map.insert(network.into(), cfg);
         self.persist()
     }
@@ -289,6 +324,8 @@ impl Nodes {
                     trusted: *trusted,
                     source: "default".into(),
                     mode: NodeMode::Remote,
+                    own: false,
+                    reach_through_tor: true,
                 }
             });
             // Fill only genuinely-empty fields on an existing record.
@@ -322,6 +359,7 @@ impl Nodes {
 
     /// Where `network`'s calls go. Local mode and your own network are direct in every mode; an
     /// onion service is Tor-only; in `identifying` a wallet first catches up from `url` directly.
+    /// A node you run at an address follows its address and `reachThroughTor`, never the mode.
     pub fn plan(&self, network: &str) -> Result<Plan> {
         let c = self.get(network).ok_or_else(|| NodeError::NotConfigured(network.into()))?;
         let tor_use = self.tor_settings.tor_use;
@@ -334,6 +372,10 @@ impl Nodes {
                 return Err(NodeError::Local(format!("no local node for {network}")));
             }
             return Ok(direct(url));
+        }
+        if c.own {
+            let via_tor = is_onion(&c.url) || (!is_own_network(&c.url) && c.reach_through_tor);
+            return Ok(Plan { cfg: c.clone(), tor_use, url: c.url.clone(), via_tor, catch_up: None });
         }
         if tor_use == TorUse::None {
             if is_onion(&c.url) {
@@ -852,7 +894,7 @@ mod tests {
     fn cfg(url: &str) -> NodeConfig {
         NodeConfig { url: url.into(), onion_url: None, username: None, password: None, proxy: None,
                      proxy_required: false, timeout_secs: 8, trusted: false, source: "external".into(),
-                     mode: NodeMode::Remote }
+                     mode: NodeMode::Remote, own: false, reach_through_tor: true }
     }
 
     fn with_mode(mode: &str) -> Nodes {
@@ -1476,5 +1518,100 @@ mod tests {
         g.note_health("mainnet", &g.plan("mainnet").unwrap(), false, &mut h);
         assert_eq!(h["operator"], "plowsof");
         assert!(h.get("pick").is_none());
+    }
+
+    // ── A node you run ───────────────────────────────────────────────────────
+
+    fn own(url: &str, through_tor: bool) -> NodeConfig {
+        NodeConfig { own: true, reach_through_tor: through_tor, ..cfg(url) }
+    }
+
+    #[test]
+    fn your_own_node_is_routed_by_its_address_whatever_use_tor_for_says() {
+        for mode in ["all", "identifying", "none"] {
+            let mut n = with_mode(mode);
+            ready_tor(&n);
+            // Your network: direct, even with the switch on, and trusted there.
+            let mut lan = own("http://192.168.1.4:18081", true);
+            lan.trusted = true;
+            n.set("stagenet", lan).unwrap();
+            let e = n.effective("stagenet").unwrap();
+            assert_eq!((&e["url"], &e["route"], &e["proxyRequired"], &e["trusted"]),
+                       (&json!("http://192.168.1.4:18081"), &json!("direct"), &json!(false), &json!(true)), "{mode}");
+            assert!(e.get("proxy").is_none() && e.get("catchUp").is_none(), "{mode}");
+            // An onion: through Tor, in none too.
+            n.set("stagenet", own(ONION, false)).unwrap();
+            let e = n.effective("stagenet").unwrap();
+            assert_eq!((&e["url"], &e["proxy"], &e["proxyRequired"]), (&json!(ONION), &json!("socks5h://127.0.0.1:9250"), &json!(true)), "{mode}");
+            assert!(e.get("catchUp").is_none(), "{mode}");
+            // Anywhere else: by the switch, to its own address with its login, never a catch-up.
+            let mut far = own("https://my.node.example:18081", true);
+            far.onion_url = Some(ONION.into());
+            far.username = Some("u".into());
+            far.password = Some("p".into());
+            n.set("stagenet", far.clone()).unwrap();
+            let e = n.effective("stagenet").unwrap();
+            assert_eq!((&e["url"], &e["route"], &e["proxyRequired"], &e["username"]),
+                       (&json!("https://my.node.example:18081"), &json!("proxied"), &json!(true), &json!("u")), "{mode}");
+            assert!(e.get("catchUp").is_none() && n.wants_tor("stagenet"), "{mode}");
+            far.reach_through_tor = false;
+            n.set("stagenet", far).unwrap();
+            let e = n.effective("stagenet").unwrap();
+            assert_eq!((&e["url"], &e["route"], &e["proxyRequired"]), (&json!("https://my.node.example:18081"), &json!("direct"), &json!(false)), "{mode}");
+            assert!(e.get("proxy").is_none() && !n.wants_tor("stagenet"), "{mode}");
+        }
+    }
+
+    #[test]
+    fn your_own_node_is_never_probed_or_moved_even_on_a_listed_address() {
+        for mode in ["none", "identifying", "all"] {
+            let n = seeded(mode, PLOWSOF, CAKE);
+            ready_tor(&n.read().unwrap());
+            // Asking for both: yours wins, so the module never takes it for its own pick.
+            n.write().unwrap().set("mainnet", NodeConfig { source: "default".into(), ..own(direct(PLOWSOF), true) }).unwrap();
+            let fake = Fake::default().with(direct(SETH), serving(900)).with(onion(SETH), serving(900));
+            tend(&n, "mainnet", &fake);
+            assert!(fake.asked().is_empty(), "{mode}");
+            let c = n.read().unwrap().get("mainnet").unwrap().clone();
+            assert_eq!((c.url.as_str(), c.source.as_str(), c.own), (direct(PLOWSOF), "external", true), "{mode}");
+        }
+    }
+
+    #[test]
+    fn choosing_the_picked_node_brings_back_the_seed_and_keeps_a_pick() {
+        let n = seeded("none", SETH, CAKE);
+        let fake = Fake::default().with(direct(SETH), serving(300)).with(direct(CAKE), serving(2)).with(direct(PLOWSOF), serving(100));
+        tend(&n, "mainnet", &fake);
+        assert_eq!(fake.asked(), [direct(SETH)]);
+        // Yours for a while, then the picked node again: the seed, whatever address came with it.
+        n.write().unwrap().set("mainnet", own("http://192.168.1.4:18081", true)).unwrap();
+        let back = NodeConfig { source: "default".into(), username: Some("u".into()), ..cfg("http://ignored.example:1") };
+        n.write().unwrap().set("mainnet", back.clone()).unwrap();
+        let (_, url, onion_seed, _) = DEFAULT_ENDPOINTS.iter().find(|d| d.0 == "mainnet").unwrap();
+        let c = n.read().unwrap().get("mainnet").unwrap().clone();
+        assert_eq!((c.url.as_str(), c.onion_url.as_deref(), c.source.as_str(), c.own, c.username), (*url, Some(*onion_seed), "default", false, None));
+        // Checked again at once, not when the earlier pick goes stale, and moved by health.
+        tend(&n, "mainnet", &fake);
+        assert_eq!(fake.asked()[0], direct(CAKE));
+        assert_eq!(stored(&n).0, direct(SETH));
+        // Saving the picked node again, through local mode and back, keeps where the pick put it.
+        n.write().unwrap().set("mainnet", NodeConfig { mode: NodeMode::Local, ..back.clone() }).unwrap();
+        n.write().unwrap().set("mainnet", back).unwrap();
+        assert_eq!(stored(&n).0, direct(SETH));
+    }
+
+    #[test]
+    fn a_node_you_set_on_your_network_is_yours_on_load_and_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("monero_nodes.json");
+        std::fs::write(&p, r#"{"stagenet":{"url":"http://192.168.1.4:38081","source":"external"},
+                              "mainnet":{"url":"https://far.example:18081","source":"external"}}"#).unwrap();
+        let n = Nodes::new(Some(p.clone()));
+        assert_eq!((n.get("stagenet").unwrap().own, n.get("mainnet").unwrap().own), (true, false));
+        assert!(n.get("mainnet").unwrap().reach_through_tor, "absent reads as on");
+        assert!(Nodes::new(Some(p)).get("stagenet").unwrap().own, "and is stored");
+        let mut n = Nodes::new(None);
+        n.set("stagenet", cfg("http://node.lan:38081")).unwrap();
+        assert!(n.get("stagenet").unwrap().own);
     }
 }

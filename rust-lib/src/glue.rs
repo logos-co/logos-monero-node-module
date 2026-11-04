@@ -24,9 +24,10 @@ use crate::node::{is_network, LocalNode, NodeConfig, Nodes};
 use crate::tor::TorView;
 
 pub trait MoneroNodeModule: Send + Sync + 'static {
-    /// Store one network's config from `{ url, onionUrl?, username?, password?, proxy?, timeoutSecs?, trusted?, mode? }`.
-    /// A full replace: `mode` is `remote` unless the config says `local`. `proxy` is which Tor:
-    /// empty or `tor` for the built-in one, else `socks5h://host:port`. Refused while a wallet is open on it.
+    /// Store one network's config from `{ url, onionUrl?, username?, password?, proxy?, timeoutSecs?, trusted?, mode?,
+    /// own?, reachThroughTor?, source? }`. A full replace: `mode` is `remote` unless the config says `local`. `proxy` is
+    /// which Tor: empty or `tor` for the built-in one, else `socks5h://host:port`. `own`: a node you run, routed by its
+    /// address and `reachThroughTor`. `source: "default"`: the node this module picks. Refused while a wallet is open on it.
     fn set_node_config(&self, network: String, config_json: String) -> String;
     fn get_node_config(&self, network: String) -> String;
     /// What a wallet dials under "Use Tor for": `{ ok, result: { url, proxy, proxyRequired,
