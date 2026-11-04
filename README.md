@@ -111,8 +111,8 @@ Its address decides the route, and "Use Tor for" does not apply:
 | anywhere else | over Tor when `reachThroughTor` (the default), else direct |
 
 There is never a `catchUp`, and the login goes to `url` over Tor too. It is never probed or moved.
-A record you set on your own network is marked `own`, on save and on load: it was direct in
-every mode, and stays so.
+A record you set on your own network, with no onion address beside it, is marked `own`, on save
+and on load: it was direct in every mode, and stays so. With an onion beside it, it stays a pair.
 
 ## Local mode
 
