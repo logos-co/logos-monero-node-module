@@ -3,8 +3,9 @@ project_name: logos-monero-node-module
 
 # Proves the module builds, loads under the logosctl daemon, and answers node_health against a
 # real public stagenet node through the fail-closed client, directly and over the Tor that
-# comes with Logos. It does not assert a fixed height (the live chain moves); it asserts the
-# node is reachable and reports a plausible shape.
+# comes with Logos, then has mainnet's seeded node checked among its listed public ones. It does
+# not assert a fixed height (the live chain moves); it asserts the node is reachable and reports
+# a plausible shape.
 #
 # Every build is a flake URL rather than a bare `nix build`: the harness runs each step in a
 # throwaway working directory, not in the checkout, so a relative build has nothing to build.
@@ -140,6 +141,28 @@ sections:
           - '\"route\":\"proxied\"'
           - '.onion:38089'
           - '\"state\":\"ready\"'
+
+  - title: "Mainnet: the seeded node is checked before a wallet dials it"
+    steps:
+      - title: "effective_node(mainnet) in Nothing, then node_health with the check"
+        # Mainnet's seeded record moves among three operators' public nodes by health. The
+        # stored node is asked first and stays while it serves; otherwise all three are measured
+        # and the best is stored. A wallet's open waits on this check, at most 14 s.
+        run: |
+          set -eu
+          export LOGOSCTL_CONFIG_DIR="$PWD/session"
+          HOME="$PWD/home" ./logos/bin/logosctl daemon start --detach
+          trap './logos/bin/logosctl daemon stop > /dev/null 2>&1 || true' EXIT
+          ./logos/bin/logosctl module load monero_node_module
+          ./logos/bin/logosctl call monero_node_module set_tor_use none
+          ./logos/bin/logosctl call monero_node_module effective_node mainnet
+          ./logos/bin/logosctl call monero_node_module node_health mainnet
+        expect_contains:
+          - '\"route\":\"direct\",\"source\":\"default\",\"timeoutSecs\":8,\"torUse\":\"none\"'
+          - '\"pick\":{\"direct\":{'
+          - '\"operator\":\"'
+          - '\"reachable\":true,\"restricted\":true,\"route\":\"direct\"'
+          - '\"synced\":true,\"targetHeight\"'
 
   - title: "Local mode: dial the node monerod_module runs"
     steps:

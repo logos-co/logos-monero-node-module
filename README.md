@@ -54,13 +54,47 @@ One setting for all networks, the same three values as the other Logos wallets. 
   `proxyRequired`) loads as `all` with that proxy as your own Tor, none as `none`, both with
   `torUseChosen: false` and `existing: true`, for the wallet to confirm. A fresh install is
   `identifying`, not chosen. `proxyRequired` on a stored record is read only for this.
-- **Defaults:** the direct nodes are monerodevs.org's over TLS (monerod's own certificate, which
-  neither wallet2 nor this module checks), the onion nodes plowsof's, from Feather's list: two
-  operators, so the catch-up node never sees the sends. Records seeded on the old plain-http
-  defaults move to these on load; a node you picked is left alone.
+- **Defaults:** the direct nodes speak TLS (this module accepts monerod's own certificate), the
+  onion nodes are onion services. Mainnet's seed is Cake Wallet's node and plowsof's onion: two
+  operators, so the catch-up node never sees the sends. Stagenet's and testnet's are both
+  plowsof's (`node*.monerodevs.org` and the `plowsof*` onions). Records seeded on the old
+  plain-http defaults move to these on load; a node you picked is left alone.
 
 `node_health` adds `torUse`, `torUseChosen`, and on a Tor route `url`, `catchUp` and `tor` (the
 built-in Tor's `{ state, progress, detail, socks, answered }`).
+
+## Mainnet's public nodes
+
+A mainnet record the module seeded (`source: "default"`, remote) moves among three operators'
+nodes by health (`rust-lib/src/pick.rs`, each with its source):
+
+| Operator | Direct node | Onion node |
+|---|---|---|
+| Cake Wallet | `xmr-node.cakewallet.com:18081` | `cakexmrkbd7…qd.onion:18081` |
+| Seth For Privacy | `node.sethforprivacy.com:18089` | `sfprpc5klz…qd.onion:18089` |
+| plowsof | `node.monerodevs.org:18089` | `plowsof3t5…id.onion:18089` |
+
+- **When:** in `effective_node`, the call a wallet makes before it dials. Only the half it dials
+  next is checked: the direct node at open in `none` and `identifying`, the onion node at open in
+  `all` and on the move to Tor in `identifying` (once Tor is ready). Once a run; again 30 min
+  after a check passed, or 5 min after one failed or `node_health` found the node not answering.
+- **How:** `get_info` (answers, `nettype` mainnet, synchronized, within 3 blocks of the highest
+  measured), then the last 150 block headers (~134 KB) read for up to 3 s (5 s over Tor). It
+  must serve 32 KB/s directly, 8 KB/s over Tor. They are ranked by the seconds a 100 KB
+  request would take: latency plus size over throughput. A check takes at most 14 s.
+- **Sticky:** the stored node is asked first, alone, and stays while it passes, so one operator
+  sees your address. Only when it fails are the other two asked, at once, and the best stored.
+  Over Tor all three are asked at once, as none of them learns your address. When nothing
+  answers, the stored node stays.
+- **Two operators:** a pick that lands on the other half's operator moves that half to another
+  operator. With a wallet open the direct node never moves, and the onion pick leaves out the
+  catch-up node's operator. A 0.1.1 record with plowsof on both halves is split on load.
+- **Never yours:** a node you set (`source` is not `default`), and local mode, are never probed
+  or moved. Saving the node form stores it as yours, and it stays where you put it.
+- **What changes:** the record's `url` / `onionUrl`, so `get_node_config`, `effective_node` (its
+  `url` and `catchUp.url`) and `node_health` follow, in the same shape. `node_health` on such a
+  record adds `operator` (who runs the node it dialled) and `pick`: this run's checks,
+  `{ direct?, tor?: { operator, url, ok, reachable, height, synced, rttMs, bytesPerSec, agoSecs } }`.
 
 ## Local mode
 

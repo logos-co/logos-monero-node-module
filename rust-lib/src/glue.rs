@@ -32,6 +32,7 @@ pub trait MoneroNodeModule: Send + Sync + 'static {
     /// What a wallet dials under "Use Tor for": `{ ok, result: { url, proxy, proxyRequired,
     /// trusted, torUse, route, torReady?, catchUp?: { url } } }`. proxy is `tor` while the
     /// built-in Tor cannot carry traffic yet. In local mode, monerod_module's loopback URL.
+    /// On a seeded mainnet record it first checks the node to be dialled, and may move it.
     fn effective_node(&self, network: String) -> String;
     /// `{ ok, torUse: "all"|"identifying"|"none", torUseChosen, existing }`.
     fn tor_use(&self) -> String;
@@ -51,7 +52,8 @@ pub trait MoneroNodeModule: Send + Sync + 'static {
     fn init_defaults(&self) -> String;
 
     /// `{ reachable, height, targetHeight, synced, restricted, rttMs, mode, torUse, torUseChosen,
-    /// url?, catchUp?, tor?, local? }`. A Tor route is not dialled while Tor is not ready.
+    /// url?, catchUp?, tor?, local?, operator?, pick? }`. A Tor route is not dialled while Tor is
+    /// not ready. `operator` and `pick` (this run's checks) are for a seeded mainnet record.
     fn node_health(&self, network: String) -> String;
 
     fn get_info(&self, network: String) -> String;
@@ -214,6 +216,8 @@ impl MoneroNodeModule for MoneroNodeModuleImpl {
 
     fn effective_node(&self, network: String) -> String {
         self.refresh_tor(&network, false);
+        // A wallet binds what this returns, so a seeded record is checked here, within 14 s.
+        crate::pick::tend(&self.nodes, &network, &crate::pick::HttpProber);
         match self.nodes.read().unwrap().effective(&network) {
             Ok(c) => json!({ "ok": true, "result": c }).to_string(),
             Err(e) => err(e),

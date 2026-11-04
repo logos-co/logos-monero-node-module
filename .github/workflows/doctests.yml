@@ -14,7 +14,8 @@ name: monero-node-module Doc-Tests
 #
 # Live dependency, stated so a red run is diagnosable: the spec talks to a public stagenet node.
 # It tries the seeded default first and two alternates after it, so one dead node does not fail
-# the run — but all three being unreachable will, and that is the network, not this repo.
+# the run — but all three being unreachable will, and that is the network, not this repo. The
+# mainnet step does the same through the module's own pick among three operators' nodes.
 
 on:
   pull_request:
