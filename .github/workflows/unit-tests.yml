@@ -54,6 +54,9 @@ jobs:
                    fail_closed_when_required_and_unset \
                    each_mode_routes_the_wallet_where_it_says \
                    onion_and_own_network_keep_their_route_in_every_mode \
-                   settings_are_locked_while_a_wallet_is_open; do
+                   settings_are_locked_while_a_wallet_is_open \
+                   a_node_you_set_is_never_probed_or_moved \
+                   with_a_wallet_open_only_the_onion_half_moves_and_never_to_the_catch_up_operator \
+                   all_never_dials_a_direct_node_and_none_never_asks_for_tor; do
             echo "$out" | grep -q "$t" || { echo "MISSING guard test: $t"; exit 1; }
           done

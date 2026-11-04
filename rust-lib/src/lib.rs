@@ -9,6 +9,8 @@
 //! the Logos glue is behind the default `logos_module` feature.
 mod proxy;
 mod node;
+#[cfg_attr(not(feature = "logos_module"), allow(dead_code))]
+mod pick;
 mod tor;
 #[cfg_attr(not(feature = "logos_module"), allow(dead_code))]
 mod gate;

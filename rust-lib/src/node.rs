@@ -11,6 +11,8 @@
 //!
 //! "Use Tor for" ([`TorUse`]) decides the route: `url` is the direct node, `onionUrl` the node
 //! over Tor, and [`Nodes::plan`] picks between them. Tor routes never fall back to direct.
+//!
+//! A mainnet record the module seeded moves among the public nodes [`crate::pick`] lists, by health.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -21,8 +23,9 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::pick::{self, Half, Job, Probe};
 use crate::proxy::{build_client, ProxyConfig};
-use crate::tor::{is_onion, is_own_network, normalize_proxy, TorSettings, TorUse, TorView, BUILT_IN};
+use crate::tor::{host_of, is_onion, is_own_network, normalize_proxy, TorSettings, TorUse, TorView, BUILT_IN};
 
 /// The networks a wallet may talk to. Fixed set: a monerod is one of these, and an
 /// unrecognised name is a configuration error, not a new network.
@@ -85,7 +88,7 @@ pub struct NodeConfig {
 fn source_default() -> String { "external".into() }
 
 impl NodeConfig {
-    fn proxy_cfg(&self) -> ProxyConfig {
+    pub(crate) fn proxy_cfg(&self) -> ProxyConfig {
         // monerod serves TLS with a certificate it made itself; wallet2 never checks it either.
         ProxyConfig::new(self.proxy.clone(), self.proxy_required, self.timeout_secs)
             .accept_self_signed(self.url.starts_with("https://"))
@@ -149,6 +152,17 @@ pub struct Nodes {
     asked: Arc<AtomicBool>,
     /// Networks the wallet engine has a wallet open on: their settings are locked.
     wallet_open: BTreeSet<String>,
+    /// This run's checks of seeded records, per network and half. In memory: a new run checks again.
+    checks: Mutex<BTreeMap<(String, Half), Check>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Check {
+    at: Option<Instant>,
+    ok: bool,
+    busy: bool,
+    /// The row the check stored, and how it measured.
+    last: Option<(usize, Probe)>,
 }
 
 impl Nodes {
@@ -166,7 +180,8 @@ impl Nodes {
                 TorSettings::migrated(map.values().any(|c| c.proxy_required || c.proxy.as_deref().is_some_and(|p| !p.trim().is_empty())))
             }
         });
-        let mut n = Self { map, path, local: None, tor_settings, tor: Arc::default(), asked: Arc::default(), wallet_open: BTreeSet::new() };
+        let mut n = Self { map, path, local: None, tor_settings, tor: Arc::default(), asked: Arc::default(),
+                           wallet_open: BTreeSet::new(), checks: Mutex::default() };
         if saved.is_none() {
             let _ = n.persist_tor();
         }
@@ -189,6 +204,7 @@ impl Nodes {
                 c.onion_url = Some(d.2.into());
                 changed = true;
             }
+            changed |= split_operators(net, c, Half::Direct);
         }
         changed
     }
@@ -347,6 +363,120 @@ impl Nodes {
             Some(v) if v.state == "failed" && !v.answered => Err(NodeError::TorNotReady(format!("Tor is not available: {}", v.detail))),
             Some(v) => Err(NodeError::TorNotReady(format!("waiting for Tor ({}, {}%)", v.state, v.progress))),
             None => Err(NodeError::TorNotReady("waiting for Tor".into())),
+        }
+    }
+
+    /// The SOCKS port a Tor route can use now, without asking for the built-in Tor.
+    fn ready_socks(&self, cfg: &NodeConfig) -> Option<String> {
+        let p = normalize_proxy(cfg.proxy.as_deref()).ok()?;
+        if p != BUILT_IN {
+            return Some(p);
+        }
+        self.tor.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|v| v.usable_socks().map(str::to_string))
+    }
+
+    /// The half of `network`'s seeded record a wallet dials next, when its check is due. Marks it busy.
+    pub(crate) fn begin_pick(&self, network: &str) -> Option<Job> {
+        let c = self.get(network).filter(|c| c.source == "default" && c.mode == NodeMode::Remote)?;
+        let listed = pick::listed(network);
+        if listed.len() < 2 {
+            return None;
+        }
+        let open = self.wallet_open.contains(network);
+        // With a wallet open only the onion node is still to be dialled, on the move to Tor.
+        let half = match (self.tor_settings.tor_use, open) {
+            (TorUse::None | TorUse::Identifying, false) => Half::Direct,
+            (TorUse::All, _) | (TorUse::Identifying, true) => Half::Tor,
+            (TorUse::None, true) => return None,
+        };
+        let socks = match half {
+            Half::Tor => Some(self.ready_socks(c)?),
+            Half::Direct => None,
+        };
+        let (stored, other) = match half {
+            Half::Direct => (Some(c.url.as_str()), c.onion_url.as_deref()),
+            Half::Tor => (c.onion_url.as_deref(), Some(c.url.as_str())),
+        };
+        // The other half has been dialled: the catch-up node's operator never gets the onion half.
+        let exclude = other.filter(|_| open).and_then(|u| pick::operator_of(network, u));
+        let rows: Vec<usize> = (0..listed.len()).filter(|&i| Some(listed[i].0) != exclude).collect();
+        let current = stored.and_then(|u| rows.iter().copied().find(|&i| host_of(half.url(i, network)) == host_of(u)));
+        let mut checks = self.checks.lock().unwrap_or_else(|e| e.into_inner());
+        let k = checks.entry((network.to_string(), half)).or_default();
+        let wait = if k.ok { pick::STALE } else { pick::RETRY };
+        if k.busy || k.at.is_some_and(|t| t.elapsed() < wait) {
+            return None;
+        }
+        k.busy = true;
+        Some(Job { network: network.into(), half, current, rows, socks })
+    }
+
+    /// Stores what a pick chose, unless the record stopped being a seeded one meanwhile.
+    pub(crate) fn finish_pick(&mut self, job: &Job, probes: &[(usize, Probe)]) {
+        let chosen = pick::choose(&job.network, job.half, job.current, probes);
+        let measured = |i: usize| probes.iter().find(|(j, _)| *j == i).cloned();
+        {
+            let mut checks = self.checks.lock().unwrap_or_else(|e| e.into_inner());
+            let k = checks.entry((job.network.clone(), job.half)).or_default();
+            *k = Check {
+                at: Some(Instant::now()),
+                ok: chosen.is_some_and(|(_, pass)| pass),
+                busy: false,
+                last: chosen.map(|(i, _)| i).or(job.current).and_then(measured),
+            };
+        }
+        let Some((i, _)) = chosen else { return };
+        let open = self.wallet_open.contains(&job.network);
+        let Some(mut c) = self.get(&job.network).filter(|c| c.source == "default" && c.mode == NodeMode::Remote).cloned() else { return };
+        if job.half == Half::Direct && open {
+            return;
+        }
+        let url = job.half.url(i, &job.network).to_string();
+        match job.half {
+            Half::Direct => c.url = url,
+            Half::Tor => c.onion_url = Some(url),
+        }
+        // The other half moves off this operator; with a wallet open it was excluded instead.
+        if !open && split_operators(&job.network, &mut c, job.half) {
+            let other = if job.half == Half::Direct { Half::Tor } else { Half::Direct };
+            self.checks.lock().unwrap_or_else(|e| e.into_inner()).remove(&(job.network.clone(), other));
+        }
+        if self.map.get(&job.network) != Some(&c) {
+            self.map.insert(job.network.clone(), c);
+            let _ = self.persist();
+        }
+    }
+
+    /// node_health on a seeded record: who runs the node, this run's checks, and a node that
+    /// stopped answering is checked again at the next resolve.
+    fn note_health(&self, network: &str, plan: &Plan, dialled: bool, h: &mut Value) {
+        if plan.cfg.source != "default" || pick::listed(network).len() < 2 {
+            return;
+        }
+        if let Some(op) = pick::operator_of(network, &plan.url) {
+            h["operator"] = json!(op);
+        }
+        let half = if plan.via_tor { Half::Tor } else { Half::Direct };
+        let mut checks = self.checks.lock().unwrap_or_else(|e| e.into_inner());
+        if dialled && h["reachable"] == false {
+            if let Some(k) = checks.get_mut(&(network.to_string(), half)) {
+                k.ok = false;
+            }
+        }
+        let report: serde_json::Map<String, Value> = checks.iter()
+            .filter(|((n, _), _)| n == network)
+            .filter_map(|((_, half), k)| {
+                let (i, p) = k.last.as_ref()?;
+                let mut v = p.json();
+                v["operator"] = json!(pick::listed(network)[*i].0);
+                v["url"] = json!(half.url(*i, network));
+                v["ok"] = json!(k.ok);
+                v["agoSecs"] = json!(k.at.map(|t| t.elapsed().as_secs()));
+                Some((half.name().to_string(), v))
+            })
+            .collect();
+        if !report.is_empty() {
+            h["pick"] = Value::Object(report);
         }
     }
 
@@ -532,11 +662,14 @@ impl Nodes {
             Err(e) => return json!({ "ok": true, "reachable": false, "error": e.to_string() }),
         };
         if !plan.via_tor {
-            return self.dial_health(network);
+            let mut h = self.dial_health(network);
+            self.note_health(network, &plan, true, &mut h);
+            return h;
         }
         let built_in = normalize_proxy(plan.cfg.proxy.as_deref()).is_ok_and(|p| p == BUILT_IN);
         let view = self.tor.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let mut h = if built_in && !view.as_ref().is_some_and(|v| v.usable_socks().is_some()) {
+        let waiting = built_in && !view.as_ref().is_some_and(|v| v.usable_socks().is_some());
+        let mut h = if waiting {
             let why = match &view {
                 None => "Tor has not started yet".to_string(),
                 Some(v) if v.state == "ready" => "the Tor SOCKS port is off".to_string(),
@@ -553,6 +686,7 @@ impl Nodes {
         if built_in {
             h["tor"] = view.map(|v| v.json()).unwrap_or(json!({ "state": "idle", "answered": false }));
         }
+        self.note_health(network, &plan, !waiting, &mut h);
         h
     }
 
@@ -664,23 +798,36 @@ fn normalise_url(url: &str) -> String {
 /// Well-known defaults so a fresh device works before any settings app has run. Public nodes
 /// for the live networks; loopback for a node the user runs themselves and for regtest.
 ///
-/// These are somebody else's machines, and each daemon on them can wedge INDEPENDENTLY of the
-/// host: on 2026-09-10 `node.monerodevs.org:38089` accepted TCP and then never answered HTTP,
-/// while 18089 and 28089 on that same host served fine. So the stagenet default moved to node2,
-/// which was measured serving all three ports. A default cannot be more than a starting point —
-/// `set_node_config` is the answer, and the wallet's Wallets screen exposes it. Deliberately no
-/// automatic failover: on a privacy coin, silently moving a user's queries to a different
-/// operator is not a convenience.
+/// These are somebody else's machines, and each daemon on them can wedge independently of the
+/// host: on 2026-09-10 `node.monerodevs.org:38089` accepted TCP and never answered HTTP, and on
+/// 2026-11-03 its 18089 served ~4 KB/s for hours. So mainnet's pair is only a seed, which
+/// [`crate::pick`] moves among three operators by health. Only a record the module seeded moves:
+/// a node you set stays where you put it, and `set_node_config` stays the answer to a bad one.
 ///
-/// The direct node speaks TLS (monerod's own certificate); the node over Tor is an onion
-/// service from Feather's list, run by someone other than the direct node's operator.
+/// The direct node speaks TLS (monerod's own certificate); the node over Tor is an onion service.
+/// Mainnet's two are two operators', so the catch-up node never sees the sends. Stagenet's and
+/// testnet's are still both plowsof's.
 /// (network, url, onionUrl, trusted)
 pub const DEFAULT_ENDPOINTS: &[(&str, &str, &str, bool)] = &[
-    ("mainnet",  "https://node.monerodevs.org:18089",  "http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:18089", false),
+    ("mainnet",  "https://xmr-node.cakewallet.com:18081", "http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:18089", false),
     ("stagenet", "https://node2.monerodevs.org:38089", "http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:38089", false),
     ("testnet",  "https://node.monerodevs.org:28089",  "http://plowsoffjexmxalw73tkjmf422gq6575fc7vicuu4javzn2ynnte6tyd.onion:28089", false),
     ("regtest",  "http://127.0.0.1:18081",             "", true),
 ];
+
+/// When both halves of a record are one listed operator's, the half other than `keep` moves to
+/// the first other operator: one operator seeing the catch-up and the sends could tie them.
+fn split_operators(network: &str, c: &mut NodeConfig, keep: Half) -> bool {
+    let a = pick::operator_of(network, &c.url);
+    let b = c.onion_url.as_deref().and_then(|u| pick::operator_of(network, u));
+    let (Some(a), true) = (a, a == b) else { return false };
+    let Some(i) = pick::listed(network).iter().position(|n| n.0 != a) else { return false };
+    match keep {
+        Half::Direct => c.onion_url = Some(Half::Tor.url(i, network).into()),
+        Half::Tor => c.url = Half::Direct.url(i, network).into(),
+    }
+    true
+}
 
 /// Plain-http defaults earlier builds seeded; a record still on one moves to TLS.
 const OLD_DEFAULT_URLS: &[&str] = &[
@@ -1061,5 +1208,273 @@ mod tests {
         let h = n.node_health("stagenet");
         assert_eq!(h["mode"], "remote");
         assert!(h.get("local").is_none());
+    }
+
+    // ── Picking among mainnet's public nodes ─────────────────────────────────
+
+    use crate::pick::{tend, Prober, MAINNET_NODES};
+    use std::sync::RwLock;
+    use std::time::Duration;
+
+    const CAKE: usize = 0;
+    const SETH: usize = 1;
+    const PLOWSOF: usize = 2;
+
+    fn direct(i: usize) -> &'static str { MAINNET_NODES[i].1 }
+    fn onion(i: usize) -> &'static str { MAINNET_NODES[i].2 }
+
+    /// Answers by URL; anything else does not answer. Records what was asked, `tor:` over Tor.
+    #[derive(Default)]
+    struct Fake { by_url: BTreeMap<String, Probe>, asked: Mutex<Vec<String>> }
+
+    impl Fake {
+        fn with(mut self, url: &str, p: Probe) -> Self { self.by_url.insert(url.into(), p); self }
+        fn asked(&self) -> Vec<String> { std::mem::take(&mut *self.asked.lock().unwrap()) }
+    }
+
+    impl Prober for Fake {
+        fn probe(&self, _: &str, dial: &NodeConfig, _: Instant) -> Probe {
+            let via = if dial.proxy.is_some() { "tor:" } else { "" };
+            self.asked.lock().unwrap().push(format!("{via}{}", dial.url));
+            self.by_url.get(&dial.url).cloned().unwrap_or_else(|| Probe::failed("no answer"))
+        }
+    }
+
+    fn serving(kib_per_sec: u64) -> Probe {
+        Probe { reachable: true, nettype: "mainnet".into(), height: 3_799_000, synced: true, rtt_ms: 700,
+                bytes_per_sec: kib_per_sec * 1024, error: None }
+    }
+
+    fn seeded(mode: &str, url: usize, onion_row: usize) -> RwLock<Nodes> {
+        let mut n = with_mode(mode);
+        n.init_defaults().unwrap();
+        let c = n.map.get_mut("mainnet").unwrap();
+        c.url = direct(url).into();
+        c.onion_url = Some(onion(onion_row).into());
+        RwLock::new(n)
+    }
+
+    fn stored(n: &RwLock<Nodes>) -> (String, String) {
+        let c = n.read().unwrap().get("mainnet").unwrap().clone();
+        (c.url, c.onion_url.unwrap_or_default())
+    }
+
+    fn age(n: &RwLock<Nodes>, by: Duration) {
+        for k in n.read().unwrap().checks.lock().unwrap().values_mut() {
+            k.at = k.at.and_then(|t| t.checked_sub(by));
+        }
+    }
+
+    #[test]
+    fn mainnet_lists_three_operators_each_with_tls_and_its_own_onion() {
+        let ops: BTreeSet<_> = MAINNET_NODES.iter().map(|n| n.0).collect();
+        assert_eq!(ops.len(), MAINNET_NODES.len());
+        for (op, url, onion) in MAINNET_NODES {
+            assert!(url.starts_with("https://") && !is_onion(url) && is_onion(onion), "{op}");
+            assert_eq!((pick::operator_of("mainnet", url), pick::operator_of("mainnet", onion)), (Some(*op), Some(*op)));
+        }
+        // The seed is two of them, run by two operators.
+        let (_, url, onion, _) = DEFAULT_ENDPOINTS.iter().find(|d| d.0 == "mainnet").unwrap();
+        let (a, b) = (pick::operator_of("mainnet", url), pick::operator_of("mainnet", onion));
+        assert!(a.is_some() && b.is_some() && a != b);
+        assert!(pick::listed("stagenet").is_empty() && pick::operator_of("stagenet", url).is_none());
+    }
+
+    #[test]
+    fn a_seeded_node_that_serves_stays_and_only_its_operator_is_asked() {
+        let n = seeded("none", CAKE, PLOWSOF);
+        let fake = Fake::default().with(direct(CAKE), serving(170)).with(direct(SETH), serving(300));
+        tend(&n, "mainnet", &fake);
+        assert_eq!(fake.asked(), [direct(CAKE)]);
+        assert_eq!(stored(&n).0, direct(CAKE));
+        // Checked once a run; again once the check is stale.
+        tend(&n, "mainnet", &fake);
+        assert!(fake.asked().is_empty());
+        age(&n, pick::STALE);
+        tend(&n, "mainnet", &fake);
+        assert_eq!(fake.asked(), [direct(CAKE)]);
+    }
+
+    #[test]
+    fn a_slow_seeded_node_moves_to_the_best_listed_one() {
+        // 2026-11-03: the seeded node served ~4 KB/s; Cake 80 KB/s, Seth 149 KB/s.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("monero_nodes.json");
+        let mut n = Nodes::new(Some(p.clone()));
+        n.init_defaults().unwrap();
+        n.map.get_mut("mainnet").unwrap().url = direct(PLOWSOF).into();
+        n.map.get_mut("mainnet").unwrap().onion_url = Some(onion(CAKE).into());
+        let n = RwLock::new(n);
+        let fake = Fake::default().with(direct(PLOWSOF), serving(4)).with(direct(CAKE), serving(80)).with(direct(SETH), serving(149));
+        tend(&n, "mainnet", &fake);
+        let asked = fake.asked();
+        assert_eq!(asked[0], direct(PLOWSOF), "the stored node first, alone");
+        assert_eq!(asked[1..].iter().cloned().collect::<BTreeSet<_>>(), [direct(CAKE).to_string(), direct(SETH).to_string()].into());
+        assert_eq!(stored(&n), (direct(SETH).to_string(), onion(CAKE).to_string()));
+        // What a wallet dials follows: the catch-up from Seth's node, then Cake's onion.
+        n.write().unwrap().set_tor_use("identifying").unwrap();
+        let e = n.read().unwrap().effective("mainnet").unwrap();
+        assert_eq!((&e["catchUp"]["url"], &e["url"], &e["source"]), (&json!(direct(SETH)), &json!(onion(CAKE)), &json!("default")));
+        assert_eq!(Nodes::new(Some(p)).get("mainnet").unwrap().url, direct(SETH));
+    }
+
+    #[test]
+    fn only_a_node_that_answers_synced_on_mainnet_at_the_top_is_picked() {
+        let behind = Probe { height: 3_798_990, ..serving(900) };
+        let syncing = Probe { synced: false, ..serving(900) };
+        let other_net = Probe { nettype: "stagenet".into(), height: 4_000_000, ..serving(900) };
+        let slow = serving(2);
+        for (probes, want) in [
+            (vec![(0, behind.clone()), (1, serving(40)), (2, syncing.clone())], Some((1, true))),
+            (vec![(0, other_net.clone()), (1, Probe::failed("x")), (2, serving(40))], Some((2, true))),
+            // Nothing passes: the best that answers, marked as not passing.
+            (vec![(0, slow.clone()), (1, Probe { rtt_ms: 5000, ..slow.clone() }), (2, syncing)], Some((0, false))),
+            (vec![(0, Probe::failed("x")), (1, other_net)], None),
+        ] {
+            assert_eq!(pick::choose("mainnet", Half::Direct, None, &probes), want, "{probes:?}");
+        }
+        // Latency counts: the same throughput a second slower loses.
+        let probes = [(0, Probe { rtt_ms: 2000, ..serving(100) }), (1, serving(100))];
+        assert_eq!(pick::choose("mainnet", Half::Direct, None, &probes), Some((1, true)));
+        // The stored node stays while it passes, even beside a faster one.
+        let probes = [(0, serving(900)), (2, serving(40))];
+        assert_eq!(pick::choose("mainnet", Half::Tor, Some(2), &probes), Some((2, true)));
+    }
+
+    #[test]
+    fn when_nothing_answers_the_stored_node_stays_and_is_retried() {
+        let n = seeded("none", PLOWSOF, CAKE);
+        let fake = Fake::default();
+        tend(&n, "mainnet", &fake);
+        assert_eq!(fake.asked().len(), 3);
+        assert_eq!(stored(&n).0, direct(PLOWSOF));
+        tend(&n, "mainnet", &fake);
+        assert!(fake.asked().is_empty(), "not again before RETRY");
+        age(&n, pick::RETRY);
+        tend(&n, "mainnet", &fake);
+        assert_eq!(fake.asked().len(), 3);
+    }
+
+    #[test]
+    fn a_node_you_set_is_never_probed_or_moved() {
+        for mode in ["none", "identifying", "all"] {
+            let n = seeded(mode, PLOWSOF, CAKE);
+            ready_tor(&n.read().unwrap());
+            n.write().unwrap().set("mainnet", both(direct(PLOWSOF))).unwrap();
+            let fake = Fake::default().with(direct(SETH), serving(900));
+            tend(&n, "mainnet", &fake);
+            assert!(fake.asked().is_empty(), "{mode}");
+            assert_eq!(stored(&n), (direct(PLOWSOF).to_string(), ONION.to_string()));
+        }
+        // Local mode keeps its seeded remote half as it is too.
+        let n = seeded("none", PLOWSOF, CAKE);
+        n.write().unwrap().map.get_mut("mainnet").unwrap().mode = NodeMode::Local;
+        let fake = Fake::default();
+        tend(&n, "mainnet", &fake);
+        assert!(fake.asked().is_empty());
+    }
+
+    #[test]
+    fn with_a_wallet_open_only_the_onion_half_moves_and_never_to_the_catch_up_operator() {
+        let n = seeded("identifying", CAKE, SETH);
+        n.write().unwrap().set_wallet_open("mainnet", true).unwrap();
+        // The move to Tor waits for Tor, and asks nobody before it is ready.
+        let fake = Fake::default().with(onion(CAKE), serving(900)).with(onion(PLOWSOF), serving(20)).with(direct(SETH), serving(900));
+        tend(&n, "mainnet", &fake);
+        assert!(fake.asked().is_empty());
+        ready_tor(&n.read().unwrap());
+        tend(&n, "mainnet", &fake);
+        let asked = fake.asked();
+        assert_eq!(asked.iter().cloned().collect::<BTreeSet<_>>(), [format!("tor:{}", onion(SETH)), format!("tor:{}", onion(PLOWSOF))].into(),
+                   "every onion but the catch-up operator's, over Tor");
+        assert_eq!(stored(&n), (direct(CAKE).to_string(), onion(PLOWSOF).to_string()));
+        let e = n.read().unwrap().effective("mainnet").unwrap();
+        assert_eq!((&e["catchUp"]["url"], &e["url"], &e["proxy"]), (&json!(direct(CAKE)), &json!(onion(PLOWSOF)), &json!("socks5h://127.0.0.1:9250")));
+    }
+
+    #[test]
+    fn all_never_dials_a_direct_node_and_none_never_asks_for_tor() {
+        let n = seeded("all", PLOWSOF, SETH);
+        let fake = Fake::default().with(onion(CAKE), serving(50)).with(direct(CAKE), serving(900));
+        tend(&n, "mainnet", &fake);
+        assert!(fake.asked().is_empty(), "no Tor yet");
+        ready_tor(&n.read().unwrap());
+        tend(&n, "mainnet", &fake);
+        let asked = fake.asked();
+        assert!(asked.len() == 3 && asked.iter().all(|u| u.starts_with("tor:") && u.contains(".onion")), "{asked:?}");
+        assert_eq!(stored(&n).1, onion(CAKE));
+
+        let n = seeded("none", PLOWSOF, SETH);
+        let fake = Fake::default().with(direct(PLOWSOF), serving(1));
+        tend(&n, "mainnet", &fake);
+        assert!(fake.asked().iter().all(|u| !u.starts_with("tor:") && !u.contains(".onion")));
+        assert!(!n.read().unwrap().asked.load(Ordering::Relaxed), "nothing asked for the built-in Tor");
+        // With a wallet open in none, the node it dialled stays.
+        let n = seeded("none", PLOWSOF, SETH);
+        n.write().unwrap().set_wallet_open("mainnet", true).unwrap();
+        tend(&n, "mainnet", &fake);
+        assert!(fake.asked().is_empty());
+    }
+
+    #[test]
+    fn a_pick_moves_the_other_half_off_its_operator() {
+        // Direct: Cake wins while Cake's onion is stored, so the onion moves to another operator.
+        let n = seeded("identifying", PLOWSOF, CAKE);
+        let fake = Fake::default().with(direct(PLOWSOF), serving(4)).with(direct(CAKE), serving(170)).with(direct(SETH), serving(60));
+        tend(&n, "mainnet", &fake);
+        let (url, on) = stored(&n);
+        assert_eq!(url, direct(CAKE));
+        assert_ne!(pick::operator_of("mainnet", &on), Some("cakewallet"));
+        // Over Tor with no wallet open: Seth's onion wins, so the direct node leaves Seth.
+        let n = seeded("all", SETH, PLOWSOF);
+        ready_tor(&n.read().unwrap());
+        let fake = Fake::default().with(onion(SETH), serving(90)).with(onion(PLOWSOF), serving(1));
+        tend(&n, "mainnet", &fake);
+        let (url, on) = stored(&n);
+        assert_eq!(on, onion(SETH));
+        assert_ne!(pick::operator_of("mainnet", &url), Some("sethforprivacy"));
+    }
+
+    #[test]
+    fn a_seeded_pair_run_by_one_operator_is_split_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("monero_nodes.json");
+        // What 0.1.1 seeded: plowsof's node and plowsof's onion. And the plain-http one before it.
+        std::fs::write(&p, format!(r#"{{"mainnet":{{"url":"{}","onionUrl":"{}","source":"default"}}}}"#, direct(PLOWSOF), onion(PLOWSOF))).unwrap();
+        let c = Nodes::new(Some(p.clone())).get("mainnet").unwrap().clone();
+        assert_eq!(c.url, direct(PLOWSOF));
+        assert_eq!(pick::operator_of("mainnet", c.onion_url.as_deref().unwrap()), Some("cakewallet"));
+        std::fs::write(&p, r#"{"mainnet":{"url":"http://node.monerodevs.org:18089","source":"default"}}"#).unwrap();
+        let c = Nodes::new(Some(p.clone())).get("mainnet").unwrap().clone();
+        assert_eq!((c.url.as_str(), c.onion_url.as_deref()), (direct(CAKE), Some(onion(PLOWSOF))));
+        // Yours stays as you set it.
+        std::fs::write(&p, format!(r#"{{"mainnet":{{"url":"{}","onionUrl":"{}","source":"external"}}}}"#, direct(PLOWSOF), onion(PLOWSOF))).unwrap();
+        assert_eq!(Nodes::new(Some(p)).get("mainnet").unwrap().onion_url.as_deref(), Some(onion(PLOWSOF)));
+    }
+
+    #[test]
+    fn node_health_names_the_operator_and_an_unanswered_node_is_checked_again() {
+        let n = seeded("none", CAKE, PLOWSOF);
+        let fake = Fake::default().with(direct(CAKE), serving(170));
+        tend(&n, "mainnet", &fake);
+        fake.asked();
+        let g = n.read().unwrap();
+        let plan = g.plan("mainnet").unwrap();
+        let mut h = json!({ "ok": true, "reachable": false, "error": "timed out" });
+        g.note_health("mainnet", &plan, true, &mut h);
+        assert_eq!((&h["operator"], &h["pick"]["direct"]["operator"], &h["pick"]["direct"]["ok"]), (&json!("cakewallet"), &json!("cakewallet"), &json!(false)));
+        assert_eq!(h["pick"]["direct"]["bytesPerSec"], 170 * 1024);
+        drop(g);
+        // Failed: due again after RETRY, not STALE.
+        age(&n, pick::RETRY);
+        tend(&n, "mainnet", &fake);
+        assert_eq!(fake.asked(), [direct(CAKE)]);
+        // Not dialled (Tor not ready) is not a failure.
+        let n = seeded("all", CAKE, PLOWSOF);
+        let g = n.read().unwrap();
+        let mut h = json!({ "reachable": false });
+        g.note_health("mainnet", &g.plan("mainnet").unwrap(), false, &mut h);
+        assert_eq!(h["operator"], "plowsof");
+        assert!(h.get("pick").is_none());
     }
 }
