@@ -206,11 +206,12 @@ impl Nodes {
     }
 
     /// Moves records the module seeded onto today's defaults: TLS, and an onion node for Tor.
-    /// A node you set on your own network is yours: it was direct in every mode, and stays so.
+    /// A node you set on your own network, with no onion beside it, is yours: it was direct in
+    /// every mode, and stays so.
     fn upgrade_defaults(&mut self) -> bool {
         let mut changed = false;
         for c in self.map.values_mut().filter(|c| c.source != "default" && c.mode == NodeMode::Remote && !c.own) {
-            if is_own_network(&c.url) {
+            if is_own_network(&c.url) && c.onion_url.as_deref().unwrap_or("").trim().is_empty() {
                 c.own = true;
                 changed = true;
             }
@@ -298,7 +299,8 @@ impl Nodes {
             cfg.url = normalise_url(&cfg.url);
             cfg.onion_url = cfg.onion_url.map(|u| normalise_url(&u)).filter(|u| !u.is_empty());
             if cfg.mode == NodeMode::Remote && cfg.url.is_empty() { return Err(NodeError::NoAddress); }
-            cfg.own |= cfg.mode == NodeMode::Remote && is_own_network(&cfg.url);
+            // With an onion beside it the record is a pair, which Tor reaches at the onion.
+            cfg.own |= cfg.mode == NodeMode::Remote && is_own_network(&cfg.url) && cfg.onion_url.is_none();
         }
         self.map.insert(network.into(), cfg);
         self.persist()
@@ -1629,5 +1631,24 @@ mod tests {
         let mut n = Nodes::new(None);
         n.set("stagenet", cfg("http://node.lan:38081")).unwrap();
         assert!(n.get("stagenet").unwrap().own);
+    }
+
+    #[test]
+    fn a_pair_whose_direct_half_is_on_your_network_stays_a_pair() {
+        // The wallet core's Tor-modes test: a loopback relay as the direct half, an onion beside it.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("monero_nodes.json");
+        std::fs::write(&p, format!(r#"{{"stagenet":{{"url":"http://127.0.0.1:38081","onionUrl":"{ONION}","source":"external"}}}}"#)).unwrap();
+        assert!(!Nodes::new(Some(p)).get("stagenet").unwrap().own, "on load");
+        for mode in ["all", "identifying"] {
+            let mut n = with_mode(mode);
+            let pair = NodeConfig { proxy: Some("socks5h://127.0.0.1:9050".into()), ..both("http://127.0.0.1:38081") };
+            n.set("stagenet", pair).unwrap();
+            assert!(!n.get("stagenet").unwrap().own, "{mode}");
+            let e = n.effective("stagenet").unwrap();
+            assert_eq!((&e["url"], &e["route"]), (&json!(ONION), &json!("proxied")), "{mode}");
+            let catch_up = e.get("catchUp").map(|c| c["url"].clone());
+            assert_eq!(catch_up, (mode == "identifying").then(|| json!("http://127.0.0.1:38081")), "{mode}");
+        }
     }
 }

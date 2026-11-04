@@ -60,6 +60,7 @@ jobs:
                    all_never_dials_a_direct_node_and_none_never_asks_for_tor \
                    your_own_node_is_routed_by_its_address_whatever_use_tor_for_says \
                    your_own_node_is_never_probed_or_moved_even_on_a_listed_address \
-                   choosing_the_picked_node_brings_back_the_seed_and_keeps_a_pick; do
+                   choosing_the_picked_node_brings_back_the_seed_and_keeps_a_pick \
+                   a_pair_whose_direct_half_is_on_your_network_stays_a_pair; do
             echo "$out" | grep -q "$t" || { echo "MISSING guard test: $t"; exit 1; }
           done
