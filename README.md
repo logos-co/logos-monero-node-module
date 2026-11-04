@@ -90,11 +90,29 @@ nodes by health (`rust-lib/src/pick.rs`, each with its source):
   operator. With a wallet open the direct node never moves, and the onion pick leaves out the
   catch-up node's operator. A 0.1.1 record with plowsof on both halves is split on load.
 - **Never yours:** a node you set (`source` is not `default`), and local mode, are never probed
-  or moved. Saving the node form stores it as yours, and it stays where you put it.
+  or moved. It stays where you put it.
+- **Back to the picked node:** `set_node_config` with `source: "default"` stores the stored seeded
+  pair again, or the seed if the record was yours, and ignores the address fields that came with it.
+  A seed that replaces your node is checked at the next `effective_node`.
 - **What changes:** the record's `url` / `onionUrl`, so `get_node_config`, `effective_node` (its
   `url` and `catchUp.url`) and `node_health` follow, in the same shape. `node_health` on such a
   record adds `operator` (who runs the node it dialled) and `pick`: this run's checks,
   `{ direct?, tor?: { operator, url, ok, reachable, height, synced, rttMs, bytesPerSec, agoSecs } }`.
+
+## Your own node at an address
+
+A record with `"own": true` is a node you run, dialled at its `url` (`onionUrl` is not used).
+Its address decides the route, and "Use Tor for" does not apply:
+
+| `url` | Route |
+|---|---|
+| this computer or its network | direct; `reachThroughTor` is ignored, as Tor can't reach it |
+| an onion service | over Tor, in `none` too |
+| anywhere else | over Tor when `reachThroughTor` (the default), else direct |
+
+There is never a `catchUp`, and the login goes to `url` over Tor too. It is never probed or moved.
+A record you set on your own network is marked `own`, on save and on load: it was direct in
+every mode, and stays so.
 
 ## Local mode
 

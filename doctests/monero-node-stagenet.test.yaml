@@ -224,3 +224,34 @@ sections:
           - '\"reachable\":true'
           - '\"route\":\"direct\"'
           - '\"state\":\"running\"'
+
+  - title: "Your own node at an address: the address decides, not Use Tor for"
+    steps:
+      - title: "Your network direct, the internet by its switch, an onion over Tor, then the picked node back"
+        # Nothing is dialled here: effective_node only resolves a record you set. The onion
+        # record asks for the built-in Tor, so its proxy reads `tor` while Tor joins.
+        run: |
+          set -eu
+          export LOGOSCTL_CONFIG_DIR="$PWD/session"
+          HOME="$PWD/home" ./logos/bin/logosctl daemon start --detach
+          trap './logos/bin/logosctl daemon stop > /dev/null 2>&1 || true' EXIT
+          ./logos/bin/logosctl module load monero_node_module
+          ./logos/bin/logosctl call monero_node_module set_tor_use all
+          ./logos/bin/logosctl call monero_node_module set_node_config stagenet 'str:{"url":"http://192.168.1.4:38081","own":true}'
+          ./logos/bin/logosctl call monero_node_module effective_node stagenet
+          ./logos/bin/logosctl call monero_node_module set_node_config stagenet \
+            'str:{"url":"https://my.node.example:38081","own":true,"reachThroughTor":false}'
+          ./logos/bin/logosctl call monero_node_module effective_node stagenet
+          ./logos/bin/logosctl call monero_node_module set_tor_use none
+          ./logos/bin/logosctl call monero_node_module set_node_config stagenet \
+            'str:{"url":"http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:38089","own":true}'
+          ./logos/bin/logosctl call monero_node_module effective_node stagenet
+          ./logos/bin/logosctl call monero_node_module set_node_config stagenet 'str:{"source":"default","url":""}'
+          ./logos/bin/logosctl call monero_node_module get_node_config stagenet
+        expect_contains:
+          - '\"route\":\"direct\",\"source\":\"external\",\"timeoutSecs\":8,\"torUse\":\"all\",\"trusted\":false,\"url\":\"http://192.168.1.4:38081\"'
+          - '\"route\":\"direct\",\"source\":\"external\",\"timeoutSecs\":8,\"torUse\":\"all\",\"trusted\":false,\"url\":\"https://my.node.example:38081\"'
+          - '\"proxyRequired\":true,\"route\":\"proxied\",\"source\":\"external\"'
+          - '\"torUse\":\"none\",\"trusted\":false,\"url\":\"http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:38089\"'
+          - '\"source\":\"default\"'
+          - '\"url\":\"https://node2.monerodevs.org:38089\"'
