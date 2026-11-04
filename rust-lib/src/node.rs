@@ -60,6 +60,8 @@ pub enum NodeMode {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeConfig {
     /// The direct node: everything in `none`, the catch-up in `identifying`.
+    /// Absent when the app asks for the picked node; `set` fills it from the seed.
+    #[serde(default)]
     pub url: String,
     /// The node over Tor, in `all` and after the catch-up in `identifying`. Empty: `url` over Tor.
     #[serde(default, rename = "onionUrl", skip_serializing_if = "Option::is_none")]
@@ -138,6 +140,8 @@ pub enum NodeError {
     TorNotReady(String),
     #[error("this node is an onion service, reachable only over Tor, and Use Tor for is Nothing")]
     TorOff,
+    #[error("enter the node's address")]
+    NoAddress,
 }
 
 type Result<T> = std::result::Result<T, NodeError>;
@@ -293,6 +297,7 @@ impl Nodes {
             cfg.source = "external".into();
             cfg.url = normalise_url(&cfg.url);
             cfg.onion_url = cfg.onion_url.map(|u| normalise_url(&u)).filter(|u| !u.is_empty());
+            if cfg.mode == NodeMode::Remote && cfg.url.is_empty() { return Err(NodeError::NoAddress); }
             cfg.own |= cfg.mode == NodeMode::Remote && is_own_network(&cfg.url);
         }
         self.map.insert(network.into(), cfg);
@@ -1575,6 +1580,17 @@ mod tests {
             let c = n.read().unwrap().get("mainnet").unwrap().clone();
             assert_eq!((c.url.as_str(), c.source.as_str(), c.own), (direct(PLOWSOF), "external", true), "{mode}");
         }
+    }
+
+    #[test]
+    fn the_picked_node_saves_from_the_apps_json_without_an_address() {
+        // What the app sends for "A node picked for you"; a node you choose still needs one.
+        let n = seeded("none", SETH, CAKE);
+        let picked: NodeConfig = serde_json::from_str(r#"{"mode":"remote","source":"default","proxy":""}"#).unwrap();
+        n.write().unwrap().set("mainnet", picked).unwrap();
+        assert_eq!(n.read().unwrap().get("mainnet").unwrap().source, "default");
+        let chosen: NodeConfig = serde_json::from_str(r#"{"mode":"remote","url":" ","proxy":""}"#).unwrap();
+        assert!(matches!(n.write().unwrap().set("mainnet", chosen), Err(NodeError::NoAddress)));
     }
 
     #[test]
