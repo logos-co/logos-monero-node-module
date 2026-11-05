@@ -1,7 +1,7 @@
 {
   "name": "monero_node_module",
   "display_name": "Monero Node RPC",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "core",
   "interface": "cdylib",
   "concurrency": "multi",
@@ -10,10 +10,10 @@
   "author": "Logos Core Team",
   "main": "monero_node_module_plugin",
   "dependencies": [
-    { "name": "tor_module", "version": "~0.1.0" }
+    { "name": "tor_module", "version": "~0.2.0" }
   ],
   "optional_dependencies": [
-    { "name": "monerod_module", "version": "~0.1.0" }
+    { "name": "monerod_module", "version": "~0.2.0" }
   ],
   "include": [],
   "capabilities": [],
