@@ -35,10 +35,11 @@ pub trait MoneroNodeModule: Send + Sync + 'static {
     /// built-in Tor cannot carry traffic yet. In local mode, monerod_module's loopback URL.
     /// On a seeded mainnet record it first checks the node to be dialled, and may move it.
     fn effective_node(&self, network: String) -> String;
-    /// `{ ok, torUse: "all"|"identifying"|"none", torUseChosen, existing }`.
-    fn tor_use(&self) -> String;
-    /// The wallet backend only: store the user's choice. `{ ok:false, error }` while a wallet is open.
-    fn set_tor_use(&self, mode: String) -> String;
+    /// `network`'s setting: `{ ok, network, torUse: "all"|"identifying"|"none", torUseChosen, existing }`.
+    fn tor_use(&self, network: String) -> String;
+    /// The wallet backend only: store the user's choice for `network`. `{ ok:false, error }`
+    /// while a wallet is open.
+    fn set_tor_use(&self, network: String, mode: String) -> String;
     /// The wallet core only: a wallet opened or closed on `network`, locking its settings.
     fn set_wallet_open(&self, network: String, open: bool) -> String;
     /// `{ ok, available, rpcUrl?, status?, error? }`: whether monerod_module can serve `network`.
@@ -153,7 +154,7 @@ impl MoneroNodeModuleImpl {
     fn refresh_tor(&self, network: &str, poll: bool) {
         let handle = {
             let n = self.nodes.read().unwrap();
-            if !n.wants_tor(network) || (poll && !n.follows_tor()) {
+            if !n.wants_tor(network) || (poll && !n.follows_tor(network)) {
                 return;
             }
             n.tor_handle()
@@ -225,15 +226,18 @@ impl MoneroNodeModule for MoneroNodeModuleImpl {
         }
     }
 
-    fn tor_use(&self) -> String {
-        self.nodes.read().unwrap().tor_use().to_string()
+    fn tor_use(&self, network: String) -> String {
+        match self.nodes.read().unwrap().tor_use(&network) {
+            Ok(v) => v.to_string(),
+            Err(e) => err(e),
+        }
     }
 
-    fn set_tor_use(&self, mode: String) -> String {
+    fn set_tor_use(&self, network: String, mode: String) -> String {
         if !self.admits(Access::Backend) {
             return err("not authorized");
         }
-        match self.nodes.write().unwrap().set_tor_use(&mode) {
+        match self.nodes.write().unwrap().set_tor_use(&network, &mode) {
             Ok(v) => v.to_string(),
             Err(e) => err(e),
         }

@@ -1,6 +1,7 @@
 //! "Use Tor for": the setting, its store beside the node registry, the built-in Tor's status,
 //! and how an address is classed (onion, own network, or anywhere else).
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -42,7 +43,7 @@ impl TorUse {
     }
 }
 
-/// `monero_tor.json`. A separate file, so an older build keeps reading the registry as it was.
+/// One network's "Use Tor for".
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TorSettings {
     #[serde(rename = "torUse")]
@@ -66,22 +67,50 @@ impl TorSettings {
         Self { tor_use: if any_proxy { TorUse::All } else { TorUse::None }, chosen: false, existing: true }
     }
 
+    /// An earlier build's one setting for every network: each network keeps its routing, to be
+    /// confirmed there.
+    pub fn carried(&self) -> Self {
+        Self { tor_use: self.tor_use, chosen: false, existing: true }
+    }
+
     pub fn path_beside(registry: &Path) -> PathBuf {
         registry.with_file_name("monero_tor.json")
     }
 
-    pub fn load(path: &Path) -> Option<Self> {
-        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    pub fn json(&self) -> Value {
+        json!({ "torUse": self.tor_use, "torUseChosen": self.chosen, "existing": self.existing })
+    }
+}
+
+/// `monero_tor.json`: each network's setting. A separate file, so an older build keeps reading
+/// the registry as it was.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TorFile {
+    pub networks: BTreeMap<String, TorSettings>,
+}
+
+/// What `monero_tor.json` held.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TorLoaded {
+    PerNetwork(TorFile),
+    /// Written by a build that kept one setting for every network.
+    Shared(TorSettings),
+}
+
+impl TorFile {
+    pub fn load(path: &Path) -> Option<TorLoaded> {
+        let text = std::fs::read_to_string(path).ok()?;
+        if let Ok(f) = serde_json::from_str::<TorFile>(&text) {
+            return Some(TorLoaded::PerNetwork(f));
+        }
+        serde_json::from_str::<TorSettings>(&text).ok().map(TorLoaded::Shared)
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_string_pretty(self).unwrap_or_default())?;
         std::fs::rename(&tmp, path)
-    }
-
-    pub fn json(&self) -> Value {
-        json!({ "torUse": self.tor_use, "torUseChosen": self.chosen, "existing": self.existing })
     }
 }
 
@@ -235,9 +264,17 @@ mod tests {
     fn settings_round_trip_and_migrate() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("monero_tor.json");
-        TorSettings::migrated(true).save(&p).unwrap();
-        assert_eq!(TorSettings::load(&p).unwrap(), TorSettings { tor_use: TorUse::All, chosen: false, existing: true });
+        let mut file = TorFile::default();
+        file.networks.insert("mainnet".into(), TorSettings::migrated(true));
+        file.networks.insert("stagenet".into(), TorSettings::fresh());
+        file.save(&p).unwrap();
+        assert_eq!(TorFile::load(&p).unwrap(), TorLoaded::PerNetwork(file));
         assert_eq!(TorSettings::migrated(false).tor_use, TorUse::None);
         assert_eq!(TorSettings::fresh().tor_use, TorUse::Identifying);
+
+        // An earlier build's single setting is read as shared, then carried to each network.
+        std::fs::write(&p, r#"{"torUse":"none","torUseChosen":true,"existing":false}"#).unwrap();
+        let Some(TorLoaded::Shared(old)) = TorFile::load(&p) else { panic!("not read as shared") };
+        assert_eq!(old.carried(), TorSettings { tor_use: TorUse::None, chosen: false, existing: true });
     }
 }
