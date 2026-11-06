@@ -20,8 +20,9 @@ or `{ "ok": false, "error": … }`. Config: `set_node_config` / `get_node_config
 
 ## Use Tor for
 
-One setting for all networks, the same three values as the other Logos wallets. It is stored in
-`monero_tor.json` beside the node registry, with `torUseChosen`.
+One setting per network, the same three values as the other Logos wallets: `tor_use(network)`,
+`set_tor_use(network, mode)`. It is stored in `monero_tor.json` beside the node registry, as
+`{ "networks": { "<network>": { "torUse", "torUseChosen", "existing" } } }`.
 
 | `torUse` | What a wallet dials (`effective_node`) |
 |---|---|
@@ -44,7 +45,7 @@ One setting for all networks, the same three values as the other Logos wallets. 
   only to `url`, never to a different onion node.
 - **Starting Tor:** tor_module starts when asked. This module asks only for a Tor route through
   the built-in Tor: on a wallet's `effective_node` and on calls, and on a `node_health` poll once
-  the user chose or a wallet asked. At most every 2 s until ready, every 30 s after.
+  the user chose for that network or a wallet asked. At most every 2 s until ready, every 30 s after.
 - **Locked while a wallet is open:** the wallet core reports `set_wallet_open(network, open)`;
   while any wallet is open `set_tor_use` answers "Close your open accounts to change this.", and
   `set_node_config` on that network is refused too. `set_tor_use` takes the wallet backend
@@ -53,7 +54,9 @@ One setting for all networks, the same three values as the other Logos wallets. 
 - **Upgrading:** an install from before this setting keeps its routing: a saved proxy (or
   `proxyRequired`) loads as `all` with that proxy as your own Tor, none as `none`, both with
   `torUseChosen: false` and `existing: true`, for the wallet to confirm. A fresh install is
-  `identifying`, not chosen. `proxyRequired` on a stored record is read only for this.
+  `identifying`, not chosen. `proxyRequired` on a stored record is read only for this. A
+  `monero_tor.json` from a build with one setting for every network gives each network that
+  value, not chosen, so the wallet asks again on each network.
 - **Defaults:** the direct nodes speak TLS (this module accepts monerod's own certificate), the
   onion nodes are onion services. Mainnet's seed is Cake Wallet's node and plowsof's onion: two
   operators, so the catch-up node never sees the sends. Stagenet's and testnet's are both
