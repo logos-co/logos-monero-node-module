@@ -49,7 +49,7 @@ sections:
         # honestly about a dead endpoint — `reachable:false` with the transport error — and
         # then being pointed somewhere else, which is the operation this step documents.
         #
-        # The alternates are DISTINCT from the seeded default (node2), so this really is three
+        # The alternates are DISTINCT from the seeded default (sethforprivacy), so this really is three
         # hosts rather than two: a fallback list whose first entry is the default it is falling
         # back from buys nothing.
         #
@@ -115,7 +115,7 @@ sections:
           ./logos/bin/logosctl call monero_node_module tor_use stagenet
         expect_contains:
           - '\"route\":\"direct\",\"source\":\"default\",\"timeoutSecs\":8,\"torUse\":\"none\"'
-          - '\"catchUp\":{\"url\":\"https://node2.monerodevs.org:38089\"}'
+          - '\"catchUp\":{\"url\":\"https://node.sethforprivacy.com:38089\"}'
           - '.onion:38089'
           - '\"proxyRequired\":true'
           - 'Close your open accounts to change this.'
@@ -254,4 +254,4 @@ sections:
           - '\"proxyRequired\":true,\"route\":\"proxied\",\"source\":\"external\"'
           - '\"torUse\":\"none\",\"trusted\":false,\"url\":\"http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:38089\"'
           - '\"source\":\"default\"'
-          - '\"url\":\"https://node2.monerodevs.org:38089\"'
+          - '\"url\":\"https://node.sethforprivacy.com:38089\"'
