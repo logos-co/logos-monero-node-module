@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 
 use crate::pick::{self, Half, Job, Probe};
 use crate::proxy::{build_client, ProxyConfig};
-use crate::tor::{host_of, is_onion, is_own_network, normalize_proxy, TorFile, TorLoaded, TorSettings, TorUse, TorView, BUILT_IN};
+use crate::tor::{host_of, is_onion, is_own_network, normalize_proxy, LocalSends, TorFile, TorLoaded, TorSettings, TorUse, TorView, BUILT_IN};
 
 /// The networks a wallet may talk to. Fixed set: a monerod is one of these, and an
 /// unrecognised name is a configuration error, not a new network.
@@ -152,6 +152,8 @@ pub trait LocalNode: Send + Sync {
     fn rpc_url(&self, network: &str) -> std::result::Result<String, String>;
     /// Its `status()`: state, network, height, peers, ...
     fn status(&self) -> std::result::Result<Value, String>;
+    /// Its stored settings for `network` (`txProxy`, ...).
+    fn config(&self, _network: &str) -> std::result::Result<Value, String> { Ok(Value::Null) }
 }
 
 /// The persisted, per-network registry. `path` is `None` in pure tests.
@@ -169,6 +171,8 @@ pub struct Nodes {
     wallet_open: BTreeSet<String>,
     /// This run's checks of seeded records, per network and half. In memory: a new run checks again.
     checks: Mutex<BTreeMap<(String, Half), Check>>,
+    /// Whether monerod_module last said it sends over Tor (`txProxy`), per network.
+    local_private: Mutex<BTreeMap<String, bool>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -198,7 +202,7 @@ impl Nodes {
                 .collect() },
         };
         let mut n = Self { map, path, local: None, tor_file, tor: Arc::default(), asked: Arc::default(),
-                           wallet_open: BTreeSet::new(), checks: Mutex::default() };
+                           wallet_open: BTreeSet::new(), checks: Mutex::default(), local_private: Mutex::default() };
         if !per_network {
             let _ = n.persist_tor();
         }
@@ -576,6 +580,19 @@ impl Nodes {
         if let Some(u) = &plan.catch_up {
             v["catchUp"] = json!({ "url": u });
         }
+        if self.own_kind(network).is_some() {
+            self.local_private(network, None);
+            let send = self.send_node(network).filter(|_| self.sends(network) == LocalSends::Servers);
+            v["localSends"] = json!(if send.is_some() { LocalSends::Servers } else { LocalSends::Node });
+            if let Some(url) = send {
+                let proxy = match self.socks(c) {
+                    Ok(p) => p,
+                    Err(NodeError::TorNotReady(_)) => BUILT_IN.to_string(),
+                    Err(e) => return Err(e),
+                };
+                v["send"] = json!({ "url": url, "proxy": proxy });
+            }
+        }
         Ok(v)
     }
 
@@ -693,6 +710,9 @@ impl Nodes {
             h["mode"] = json!(mode);
             let t = self.tor_of(network);
             (h["torUse"], h["torUseChosen"]) = (json!(t.tor_use), json!(t.chosen));
+            if self.own_kind(network).is_some() {
+                h["sends"] = self.sends_value(network);
+            }
             return h;
         }
         // Ask the local node first: when it is absent that one bounded call is the whole cost,
@@ -705,9 +725,11 @@ impl Nodes {
             self.dial_health(network)
         };
         h["mode"] = json!(mode);
+        self.local_private(network, Some(&local));
         h["local"] = local;
         let t = self.tor_of(network);
         (h["torUse"], h["torUseChosen"]) = (json!(t.tor_use), json!(t.chosen));
+        h["sends"] = self.sends_value(network);
         h
     }
 
@@ -756,6 +778,9 @@ impl Nodes {
         }
         let mut v = self.tor_of(network).json();
         (v["ok"], v["network"]) = (json!(true), json!(network));
+        if self.own_kind(network).is_some() {
+            v["sends"] = self.sends_value(network);
+        }
         Ok(v)
     }
 
@@ -770,13 +795,97 @@ impl Nodes {
             return Err(NodeError::Locked("Close your open accounts to change this.".into()));
         }
         let before = self.tor_file.clone();
-        let existing = self.tor_of(network).existing;
-        self.tor_file.networks.insert(network.into(), TorSettings { tor_use, chosen: true, existing });
+        let TorSettings { existing, local_sends, .. } = self.tor_of(network);
+        self.tor_file.networks.insert(network.into(), TorSettings { tor_use, chosen: true, existing, local_sends });
         if let Err(e) = self.persist_tor() {
             self.tor_file = before;
             return Err(e);
         }
         self.tor_use(network)
+    }
+
+    /// Where payments go with your own node on `network`: `servers` (a public node over Tor) or
+    /// `node`. Refused while any wallet is open, as `set_tor_use` is.
+    pub fn set_local_sends(&mut self, network: &str, via: &str) -> Result<Value> {
+        if !is_network(network) {
+            return Err(NodeError::UnknownNetwork(network.into()));
+        }
+        let via = LocalSends::parse(via).ok_or_else(|| NodeError::Parse(format!("unknown route: {via} (servers or node)")))?;
+        if !self.wallet_open.is_empty() {
+            return Err(NodeError::Locked("Close your open accounts to change this.".into()));
+        }
+        let before = self.tor_file.clone();
+        let t = TorSettings { local_sends: Some(via), ..self.tor_of(network) };
+        self.tor_file.networks.insert(network.into(), t);
+        if let Err(e) = self.persist_tor() {
+            self.tor_file = before;
+            return Err(e);
+        }
+        let mut v = self.sends_value(network);
+        (v["ok"], v["network"]) = (json!(true), json!(network));
+        Ok(v)
+    }
+
+    /// Your own node on `network`: in Logos (`Local`) or at an address (`Remote`); else none.
+    fn own_kind(&self, network: &str) -> Option<NodeMode> {
+        self.get(network).and_then(|c| match c.mode {
+            NodeMode::Local => Some(NodeMode::Local),
+            NodeMode::Remote if c.own => Some(NodeMode::Remote),
+            _ => None,
+        })
+    }
+
+    /// The public node payments go to over Tor; none on regtest.
+    fn send_node(&self, network: &str) -> Option<&'static str> {
+        DEFAULT_ENDPOINTS.iter().find(|d| d.0 == network).map(|d| d.2).filter(|u| !u.is_empty())
+    }
+
+    /// Your node in Logos when it sends over Tor itself (`txProxy`), else a public node over Tor.
+    fn sends_recommended(&self, network: &str) -> LocalSends {
+        let private = self.local_private.lock().unwrap_or_else(|e| e.into_inner()).get(network).copied();
+        if self.own_kind(network) == Some(NodeMode::Local) && private == Some(true) { LocalSends::Node } else { LocalSends::Servers }
+    }
+
+    /// The pick, else the recommendation; your node where no public node is listed.
+    fn sends(&self, network: &str) -> LocalSends {
+        if self.send_node(network).is_none() {
+            return LocalSends::Node;
+        }
+        self.tor_of(network).local_sends.unwrap_or_else(|| self.sends_recommended(network))
+    }
+
+    /// `{ localSends, localSendsChosen, localSendsRecommended, sendNode?: { url, operator? } }`.
+    fn sends_value(&self, network: &str) -> Value {
+        let mut v = json!({
+            "localSends": self.sends(network),
+            "localSendsChosen": self.tor_of(network).local_sends.is_some(),
+            "localSendsRecommended": self.sends_recommended(network),
+        });
+        if let Some(url) = self.send_node(network) {
+            v["sendNode"] = json!({ "url": url, "operator": pick::operator_of(network, url) });
+        }
+        v
+    }
+
+    /// Reads whether monerod sends over Tor: the running node's `txProxy`, else its setting.
+    fn local_private(&self, network: &str, status: Option<&Value>) {
+        if self.own_kind(network) != Some(NodeMode::Local) {
+            return;
+        }
+        let Some(local) = self.local.as_ref() else { return };
+        let fetched;
+        let status = match status {
+            Some(s) => s,
+            None => { fetched = local.status().unwrap_or(Value::Null); &fetched }
+        };
+        let private = if status["state"] == "running" && status["network"] == network {
+            Some(status["txProxy"] == "on")
+        } else {
+            local.config(network).ok().and_then(|c| c["txProxy"].as_bool())
+        };
+        if let Some(p) = private {
+            self.local_private.lock().unwrap_or_else(|e| e.into_inner()).insert(network.into(), p);
+        }
     }
 
     /// The wallet engine says a wallet opened or closed on `network`.
@@ -789,10 +898,15 @@ impl Nodes {
     }
 
     /// Whether `network` goes through the built-in Tor, so tor_module's status is needed.
-    /// Local mode never does, and is skipped first: resolving it is an IPC call.
+    /// The node in Logos never does, and is skipped first: resolving it is an IPC call.
     pub fn wants_tor(&self, network: &str) -> bool {
+        let built_in = |c: &NodeConfig| normalize_proxy(c.proxy.as_deref()).is_ok_and(|x| x == BUILT_IN);
+        // Payments through a public node go over Tor; known without asking monerod_module.
+        if self.own_kind(network).is_some() && self.sends(network) == LocalSends::Servers {
+            return self.get(network).is_some_and(built_in);
+        }
         self.get(network).is_some_and(|c| c.mode == NodeMode::Remote)
-            && self.plan(network).is_ok_and(|p| p.via_tor && normalize_proxy(p.cfg.proxy.as_deref()).is_ok_and(|x| x == BUILT_IN))
+            && self.plan(network).is_ok_and(|p| p.via_tor && built_in(&p.cfg))
     }
 
     /// Whether a health poll on `network` may ask tor_module: once the user chose there, or a
@@ -1290,6 +1404,85 @@ mod tests {
         assert!(h.get("local").is_none());
     }
 
+    // ── Sending payments with your own node ──────────────────────────────────
+
+    struct TxLocal { status: Value, config: Value }
+    impl LocalNode for TxLocal {
+        fn rpc_url(&self, _: &str) -> std::result::Result<String, String> { Ok("http://127.0.0.1:18081".into()) }
+        fn status(&self) -> std::result::Result<Value, String> { Ok(self.status.clone()) }
+        fn config(&self, _: &str) -> std::result::Result<Value, String> { Ok(self.config.clone()) }
+    }
+
+    #[test]
+    fn payments_with_your_node_at_an_address_go_to_a_public_node_over_tor_until_you_pick_yours() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("monero_nodes.json");
+        let mut n = Nodes::new(Some(p.clone()));
+        n.set("stagenet", own("http://192.168.1.5:38081", true)).unwrap();
+        let e = n.effective("stagenet").unwrap();
+        assert_eq!((&e["url"], &e["route"], &e["localSends"]), (&json!("http://192.168.1.5:38081"), &json!("direct"), &json!("servers")));
+        assert_eq!(e["send"], json!({ "url": DEFAULT_ENDPOINTS[1].2, "proxy": "tor" }), "waits for Tor, never your node");
+        assert!(n.wants_tor("stagenet"));
+        ready_tor(&n);
+        assert_eq!(n.effective("stagenet").unwrap()["send"]["proxy"], "socks5h://127.0.0.1:9250");
+        let s = &n.tor_use("stagenet").unwrap()["sends"];
+        assert_eq!((&s["localSends"], &s["localSendsChosen"], &s["localSendsRecommended"]), (&json!("servers"), &json!(false), &json!("servers")));
+
+        n.set_wallet_open("mainnet", true).unwrap();
+        assert!(matches!(n.set_local_sends("stagenet", "node"), Err(NodeError::Locked(_))));
+        n.set_wallet_open("mainnet", false).unwrap();
+        assert!(n.set_local_sends("stagenet", "relay").is_err());
+        assert_eq!(n.set_local_sends("stagenet", "node").unwrap()["localSendsChosen"], true);
+        let e = n.effective("stagenet").unwrap();
+        assert_eq!(e["localSends"], "node");
+        assert!(e.get("send").is_none());
+        assert!(!n.wants_tor("stagenet"), "your node on your network needs no Tor");
+
+        // Kept across "Use Tor for" and a restart.
+        n.set_tor_use("stagenet", "all").unwrap();
+        let n = Nodes::new(Some(p));
+        assert_eq!(n.tor_of("stagenet").local_sends, Some(LocalSends::Node));
+    }
+
+    #[test]
+    fn only_your_own_node_gets_the_choice_and_regtest_sends_through_it() {
+        let mut n = Nodes::new(None);
+        n.set("stagenet", cfg("https://node2.monerodevs.org:38089")).unwrap();
+        let e = n.effective("stagenet").unwrap();
+        assert!(e.get("localSends").is_none() && e.get("send").is_none());
+        assert!(n.node_health("stagenet").get("sends").is_none());
+        n.set("regtest", own("http://127.0.0.1:18081", true)).unwrap();
+        let e = n.effective("regtest").unwrap();
+        assert_eq!(e["localSends"], "node");
+        assert!(e.get("send").is_none());
+    }
+
+    #[test]
+    fn the_node_in_logos_is_recommended_while_it_sends_over_tor_itself() {
+        let with = |status: Value, config: Value| {
+            let mut n = Nodes::new(None).with_local(Box::new(TxLocal { status, config }));
+            n.set("mainnet", local("https://xmr-node.cakewallet.com:18081")).unwrap();
+            n
+        };
+        let n = with(json!({ "state": "running", "network": "mainnet", "txProxy": "on" }), json!({ "txProxy": false }));
+        let e = n.effective("mainnet").unwrap();
+        assert_eq!(e["localSends"], "node");
+        assert!(e.get("send").is_none());
+        assert_eq!(n.node_health("mainnet")["sends"]["localSendsRecommended"], "node");
+
+        // No Tor for the running node: it relays from its IP, so a public node over Tor.
+        let n = with(json!({ "state": "running", "network": "mainnet", "txProxy": "unavailable" }), json!({ "txProxy": true }));
+        assert_eq!(n.effective("mainnet").unwrap()["localSends"], "servers");
+
+        // Stopped, or running another network: its setting.
+        let n = with(json!({ "state": "stopped" }), json!({ "txProxy": true }));
+        assert_eq!(n.effective("mainnet").unwrap()["localSends"], "node");
+        let n = with(json!({ "state": "running", "network": "stagenet", "txProxy": "off" }), json!({ "txProxy": false }));
+        let e = n.effective("mainnet").unwrap();
+        assert_eq!((&e["localSends"], &e["send"]["url"]), (&json!("servers"), &json!(DEFAULT_ENDPOINTS[0].2)));
+        assert_eq!(n.node_health("mainnet")["sends"]["sendNode"]["operator"], json!(pick::operator_of("mainnet", DEFAULT_ENDPOINTS[0].2)));
+    }
+
     // ── Picking among mainnet's public nodes ─────────────────────────────────
 
     use crate::pick::{tend, Prober, MAINNET_NODES};
@@ -1596,7 +1789,9 @@ mod tests {
             n.set("stagenet", far).unwrap();
             let e = n.effective("stagenet").unwrap();
             assert_eq!((&e["url"], &e["route"], &e["proxyRequired"]), (&json!("https://my.node.example:18081"), &json!("direct"), &json!(false)), "{mode}");
-            assert!(e.get("proxy").is_none() && !n.wants_tor("stagenet"), "{mode}");
+            assert!(e.get("proxy").is_none() && n.wants_tor("stagenet"), "{mode}: payments still go over Tor");
+            n.set_local_sends("stagenet", "node").unwrap();
+            assert!(!n.wants_tor("stagenet"), "{mode}");
         }
     }
 
