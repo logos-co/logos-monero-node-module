@@ -870,13 +870,13 @@ fn normalise_url(url: &str) -> String {
 /// a node you set stays where you put it, and `set_node_config` stays the answer to a bad one.
 ///
 /// The direct node speaks TLS (monerod's own certificate); the node over Tor is an onion service.
-/// Mainnet's two are two operators', so the catch-up node never sees the sends. Stagenet's and
-/// testnet's are still both plowsof's.
+/// On every network the two are two operators', so the catch-up node never sees the sends: on
+/// stagenet and testnet sethforprivacy's direct node (feather-nodes nodes.yaml) and plowsof's onion.
 /// (network, url, onionUrl, trusted)
 pub const DEFAULT_ENDPOINTS: &[(&str, &str, &str, bool)] = &[
     ("mainnet",  "https://xmr-node.cakewallet.com:18081", "http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:18089", false),
-    ("stagenet", "https://node2.monerodevs.org:38089", "http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:38089", false),
-    ("testnet",  "https://node.monerodevs.org:28089",  "http://plowsoffjexmxalw73tkjmf422gq6575fc7vicuu4javzn2ynnte6tyd.onion:28089", false),
+    ("stagenet", "https://node.sethforprivacy.com:38089", "http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:38089", false),
+    ("testnet",  "https://node.sethforprivacy.com:28089", "http://plowsoffjexmxalw73tkjmf422gq6575fc7vicuu4javzn2ynnte6tyd.onion:28089", false),
     ("regtest",  "http://127.0.0.1:18081",             "", true),
 ];
 
@@ -894,9 +894,11 @@ fn split_operators(network: &str, c: &mut NodeConfig, keep: Half) -> bool {
     true
 }
 
-/// Plain-http defaults earlier builds seeded; a record still on one moves to TLS.
+/// Direct defaults earlier builds seeded: plain http, and plowsof's beside plowsof's onion on
+/// stagenet and testnet. A record still on one moves to today's.
 const OLD_DEFAULT_URLS: &[&str] = &[
     "http://node.monerodevs.org:18089", "http://node2.monerodevs.org:38089", "http://node.monerodevs.org:28089",
+    "https://node2.monerodevs.org:38089", "https://node.monerodevs.org:28089",
 ];
 
 #[cfg(test)]
@@ -1138,15 +1140,40 @@ mod tests {
                               "mainnet":{"url":"http://node.monerodevs.org:18089","source":"external"}}"#).unwrap();
         let n = Nodes::new(Some(p.clone()));
         let s = n.get("stagenet").unwrap();
-        assert_eq!(s.url, "https://node2.monerodevs.org:38089");
+        assert_eq!(s.url, "https://node.sethforprivacy.com:38089");
         assert!(s.onion_url.as_deref().is_some_and(|u| u.ends_with(".onion:38089")));
         // A node the user picked stays exactly as it was.
         let m = n.get("mainnet").unwrap();
         assert_eq!((m.url.as_str(), m.onion_url.is_none()), ("http://node.monerodevs.org:18089", true));
-        assert_eq!(Nodes::new(Some(p)).get("stagenet").unwrap().url, "https://node2.monerodevs.org:38089");
+        assert_eq!(Nodes::new(Some(p)).get("stagenet").unwrap().url, "https://node.sethforprivacy.com:38089");
         for (_, url, onion, _) in DEFAULT_ENDPOINTS {
             assert!(onion.is_empty() || (is_onion(onion) && !is_onion(url) && url.starts_with("https://")), "{url}");
         }
+    }
+
+    #[test]
+    fn every_seeded_pair_is_two_operators() {
+        // By host, as feather-nodes nodes.yaml lists them.
+        let operator = |url: &str| match host_of(url) {
+            h if h.ends_with("monerodevs.org") || h.starts_with("plowsof") => "plowsof",
+            h if h.ends_with("cakewallet.com") => "cakewallet",
+            h if h.ends_with("sethforprivacy.com") => "sethforprivacy",
+            h => panic!("no operator known for {h}"),
+        };
+        for (net, url, onion, _) in DEFAULT_ENDPOINTS.iter().filter(|d| !d.2.is_empty()) {
+            assert_ne!(operator(url), operator(onion), "{net}: the catch-up node would see the sends");
+        }
+        // A stagenet record seeded with plowsof on both halves moves its direct half.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("monero_nodes.json");
+        let onion = "http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:38089";
+        std::fs::write(&p, json!({"stagenet": {"url": "https://node2.monerodevs.org:38089", "onionUrl": onion, "source": "default"},
+                                  "testnet": {"url": "https://node.monerodevs.org:28089", "source": "external"}}).to_string()).unwrap();
+        let n = Nodes::new(Some(p));
+        let s = n.get("stagenet").unwrap();
+        assert_eq!((s.url.as_str(), s.onion_url.as_deref()), ("https://node.sethforprivacy.com:38089", Some(onion)));
+        // A node the user set stays.
+        assert_eq!(n.get("testnet").unwrap().url, "https://node.monerodevs.org:28089");
     }
 
     #[test]
