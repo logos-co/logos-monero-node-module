@@ -31,15 +31,21 @@ pub trait MoneroNodeModule: Send + Sync + 'static {
     fn set_node_config(&self, network: String, config_json: String) -> String;
     fn get_node_config(&self, network: String) -> String;
     /// What a wallet dials under "Use Tor for": `{ ok, result: { url, proxy, proxyRequired,
-    /// trusted, torUse, route, torReady?, catchUp?: { url } } }`. proxy is `tor` while the
-    /// built-in Tor cannot carry traffic yet. In local mode, monerod_module's loopback URL.
+    /// trusted, torUse, route, torReady?, catchUp?: { url }, localSends?, send?: { url, proxy } } }`.
+    /// proxy is `tor` while the built-in Tor cannot carry traffic yet. In local mode, monerod_module's
+    /// loopback URL. `send`: with your own node, the public node payments go to over Tor.
     /// On a seeded mainnet record it first checks the node to be dialled, and may move it.
     fn effective_node(&self, network: String) -> String;
-    /// `network`'s setting: `{ ok, network, torUse: "all"|"identifying"|"none", torUseChosen, existing }`.
+    /// `network`'s setting: `{ ok, network, torUse: "all"|"identifying"|"none", torUseChosen, existing,
+    /// sends? }`. `sends`, with your own node: as `set_local_sends` answers.
     fn tor_use(&self, network: String) -> String;
     /// The wallet backend only: store the user's choice for `network`. `{ ok:false, error }`
     /// while a wallet is open.
     fn set_tor_use(&self, network: String, mode: String) -> String;
+    /// The wallet backend only: with your own node, where `network`'s payments go: `servers` (a
+    /// public node over Tor) or `node`. `{ ok, network, localSends, localSendsChosen,
+    /// localSendsRecommended, sendNode? }`, or `{ ok:false, error }` while a wallet is open.
+    fn set_local_sends(&self, network: String, via: String) -> String;
     /// The wallet core only: a wallet opened or closed on `network`, locking its settings.
     fn set_wallet_open(&self, network: String, open: bool) -> String;
     /// `{ ok, available, rpcUrl?, status?, error? }`: whether monerod_module can serve `network`.
@@ -54,7 +60,7 @@ pub trait MoneroNodeModule: Send + Sync + 'static {
     fn init_defaults(&self) -> String;
 
     /// `{ reachable, height, targetHeight, synced, restricted, rttMs, mode, torUse, torUseChosen,
-    /// url?, catchUp?, tor?, local?, operator?, pick? }`. A Tor route is not dialled while Tor is
+    /// url?, catchUp?, tor?, local?, operator?, pick?, sends? }`. A Tor route is not dialled while Tor is
     /// not ready. `operator` and `pick` (this run's checks) are for a seeded mainnet record.
     fn node_health(&self, network: String) -> String;
 
@@ -104,6 +110,12 @@ impl LocalNode for MonerodLocal {
     fn status(&self) -> std::result::Result<Value, String> {
         monerod_module::MonerodModuleClient::new()
             .status_with_timeout(LOCAL_BUDGET)
+            .map_err(why)
+    }
+
+    fn config(&self, network: &str) -> std::result::Result<Value, String> {
+        monerod_module::MonerodModuleClient::new()
+            .get_config_with_timeout(network, LOCAL_BUDGET)
             .map_err(why)
     }
 }
@@ -238,6 +250,16 @@ impl MoneroNodeModule for MoneroNodeModuleImpl {
             return err("not authorized");
         }
         match self.nodes.write().unwrap().set_tor_use(&network, &mode) {
+            Ok(v) => v.to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    fn set_local_sends(&self, network: String, via: String) -> String {
+        if !self.admits(Access::Backend) {
+            return err("not authorized");
+        }
+        match self.nodes.write().unwrap().set_local_sends(&network, &via) {
             Ok(v) => v.to_string(),
             Err(e) => err(e),
         }
