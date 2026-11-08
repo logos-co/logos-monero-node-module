@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 
 use crate::pick::{self, Half, Job, Probe};
 use crate::proxy::{build_client, ProxyConfig};
-use crate::tor::{host_of, is_onion, is_own_network, normalize_proxy, TorSettings, TorUse, TorView, BUILT_IN};
+use crate::tor::{host_of, is_onion, is_own_network, normalize_proxy, TorFile, TorLoaded, TorSettings, TorUse, TorView, BUILT_IN};
 
 /// The networks a wallet may talk to. Fixed set: a monerod is one of these, and an
 /// unrecognised name is a configuration error, not a new network.
@@ -159,7 +159,8 @@ pub struct Nodes {
     map: BTreeMap<String, NodeConfig>,
     path: Option<PathBuf>,
     local: Option<Box<dyn LocalNode>>,
-    tor_settings: TorSettings,
+    /// Each network's "Use Tor for".
+    tor_file: TorFile,
     /// The built-in Tor as tor_module last answered, written by the glue.
     tor: Arc<Mutex<Option<TorView>>>,
     /// A wallet asked for a route through the built-in Tor, so following it may start it.
@@ -186,17 +187,19 @@ impl Nodes {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str::<BTreeMap<String, NodeConfig>>(&s).ok())
             .unwrap_or_default();
-        let saved = path.as_deref().and_then(|p| TorSettings::load(&TorSettings::path_beside(p)));
-        let tor_settings = saved.clone().unwrap_or_else(|| {
-            if map.is_empty() {
-                TorSettings::fresh()
-            } else {
-                TorSettings::migrated(map.values().any(|c| c.proxy_required || c.proxy.as_deref().is_some_and(|p| !p.trim().is_empty())))
-            }
-        });
-        let mut n = Self { map, path, local: None, tor_settings, tor: Arc::default(), asked: Arc::default(),
+        let saved = path.as_deref().and_then(|p| TorFile::load(&TorSettings::path_beside(p)));
+        let per_network = matches!(saved, Some(TorLoaded::PerNetwork(_)));
+        let tor_file = match saved {
+            Some(TorLoaded::PerNetwork(f)) => f,
+            Some(TorLoaded::Shared(old)) => TorFile { networks: NETWORKS.iter().map(|n| (n.to_string(), old.carried())).collect() },
+            // Before the setting: each configured network keeps its routing, to be confirmed.
+            None => TorFile { networks: map.iter()
+                .map(|(net, c)| (net.clone(), TorSettings::migrated(c.proxy_required || c.proxy.as_deref().is_some_and(|p| !p.trim().is_empty()))))
+                .collect() },
+        };
+        let mut n = Self { map, path, local: None, tor_file, tor: Arc::default(), asked: Arc::default(),
                            wallet_open: BTreeSet::new(), checks: Mutex::default() };
-        if saved.is_none() {
+        if !per_network {
             let _ = n.persist_tor();
         }
         if n.upgrade_defaults() {
@@ -233,7 +236,12 @@ impl Nodes {
 
     fn persist_tor(&self) -> Result<()> {
         let Some(p) = self.path.as_ref() else { return Ok(()) };
-        self.tor_settings.save(&TorSettings::path_beside(p)).map_err(|e| NodeError::Http(e.to_string()))
+        self.tor_file.save(&TorSettings::path_beside(p)).map_err(|e| NodeError::Http(e.to_string()))
+    }
+
+    /// `network`'s "Use Tor for"; a network never set up starts fresh.
+    pub fn tor_of(&self, network: &str) -> TorSettings {
+        self.tor_file.networks.get(network).cloned().unwrap_or_else(TorSettings::fresh)
     }
 
     pub fn with_local(mut self, local: Box<dyn LocalNode>) -> Self {
@@ -369,7 +377,7 @@ impl Nodes {
     /// A node you run at an address follows its address and `reachThroughTor`, never the mode.
     pub fn plan(&self, network: &str) -> Result<Plan> {
         let c = self.get(network).ok_or_else(|| NodeError::NotConfigured(network.into()))?;
-        let tor_use = self.tor_settings.tor_use;
+        let tor_use = self.tor_of(network).tor_use;
         let direct = |url: String| Plan { cfg: c.clone(), tor_use, url, via_tor: false, catch_up: None };
         if c.mode == NodeMode::Local {
             let local = self.local.as_ref()
@@ -433,7 +441,7 @@ impl Nodes {
         }
         let open = self.wallet_open.contains(network);
         // With a wallet open only the onion node is still to be dialled, on the move to Tor.
-        let half = match (self.tor_settings.tor_use, open) {
+        let half = match (self.tor_of(network).tor_use, open) {
             (TorUse::None | TorUse::Identifying, false) => Half::Direct,
             (TorUse::All, _) | (TorUse::Identifying, true) => Half::Tor,
             (TorUse::None, true) => return None,
@@ -683,8 +691,8 @@ impl Nodes {
         if mode == NodeMode::Remote {
             let mut h = self.remote_health(network);
             h["mode"] = json!(mode);
-            h["torUse"] = json!(self.tor_settings.tor_use);
-            h["torUseChosen"] = json!(self.tor_settings.chosen);
+            let t = self.tor_of(network);
+            (h["torUse"], h["torUseChosen"]) = (json!(t.tor_use), json!(t.chosen));
             return h;
         }
         // Ask the local node first: when it is absent that one bounded call is the whole cost,
@@ -698,8 +706,8 @@ impl Nodes {
         };
         h["mode"] = json!(mode);
         h["local"] = local;
-        h["torUse"] = json!(self.tor_settings.tor_use);
-        h["torUseChosen"] = json!(self.tor_settings.chosen);
+        let t = self.tor_of(network);
+        (h["torUse"], h["torUseChosen"]) = (json!(t.tor_use), json!(t.chosen));
         h
     }
 
@@ -741,27 +749,34 @@ impl Nodes {
 
     // ── Use Tor for ───────────────────────────────────────────────────────────
 
-    /// `{ ok, torUse, torUseChosen, existing }`.
-    pub fn tor_use(&self) -> Value {
-        let mut v = self.tor_settings.json();
-        v["ok"] = json!(true);
-        v
+    /// `{ ok, network, torUse, torUseChosen, existing }`.
+    pub fn tor_use(&self, network: &str) -> Result<Value> {
+        if !is_network(network) {
+            return Err(NodeError::UnknownNetwork(network.into()));
+        }
+        let mut v = self.tor_of(network).json();
+        (v["ok"], v["network"]) = (json!(true), json!(network));
+        Ok(v)
     }
 
-    /// Stores the user's choice. Refused while any wallet is open: it binds its node at open.
-    pub fn set_tor_use(&mut self, mode: &str) -> Result<Value> {
+    /// Stores the user's choice for `network`. Refused while any wallet is open: it binds its
+    /// node at open.
+    pub fn set_tor_use(&mut self, network: &str, mode: &str) -> Result<Value> {
+        if !is_network(network) {
+            return Err(NodeError::UnknownNetwork(network.into()));
+        }
         let tor_use = TorUse::parse(mode).ok_or_else(|| NodeError::Parse(format!("unknown mode: {mode} (all, identifying or none)")))?;
         if !self.wallet_open.is_empty() {
             return Err(NodeError::Locked("Close your open accounts to change this.".into()));
         }
-        let before = self.tor_settings.clone();
-        self.tor_settings.tor_use = tor_use;
-        self.tor_settings.chosen = true;
+        let before = self.tor_file.clone();
+        let existing = self.tor_of(network).existing;
+        self.tor_file.networks.insert(network.into(), TorSettings { tor_use, chosen: true, existing });
         if let Err(e) = self.persist_tor() {
-            self.tor_settings = before;
+            self.tor_file = before;
             return Err(e);
         }
-        Ok(self.tor_use())
+        self.tor_use(network)
     }
 
     /// The wallet engine says a wallet opened or closed on `network`.
@@ -780,10 +795,11 @@ impl Nodes {
             && self.plan(network).is_ok_and(|p| p.via_tor && normalize_proxy(p.cfg.proxy.as_deref()).is_ok_and(|x| x == BUILT_IN))
     }
 
-    /// Whether a health poll may ask tor_module: once the user chose, or a wallet asked for Tor.
-    /// Asking starts Tor, and a poll alone must not start it before the first-run choice.
-    pub fn follows_tor(&self) -> bool {
-        self.tor_settings.chosen || self.asked.load(Ordering::Relaxed)
+    /// Whether a health poll on `network` may ask tor_module: once the user chose there, or a
+    /// wallet asked for Tor. Asking starts Tor, and a poll alone must not start it before the
+    /// first-run choice.
+    pub fn follows_tor(&self, network: &str) -> bool {
+        self.tor_of(network).chosen || self.asked.load(Ordering::Relaxed)
     }
 
     /// Where the glue writes tor_module's status, without the registry's lock.
@@ -906,7 +922,9 @@ mod tests {
 
     fn with_mode(mode: &str) -> Nodes {
         let mut n = Nodes::new(None);
-        n.set_tor_use(mode).unwrap();
+        for net in NETWORKS {
+            n.set_tor_use(net, mode).unwrap();
+        }
         n
     }
 
@@ -983,13 +1001,13 @@ mod tests {
         assert_eq!((&e["url"], &e["proxyRequired"]), (&json!("https://clear.example:38089"), &json!(false)));
         assert!(e.get("proxy").is_none() && e.get("catchUp").is_none() && !n.wants_tor("stagenet"));
 
-        n.set_tor_use("all").unwrap();
+        n.set_tor_use("stagenet", "all").unwrap();
         ready_tor(&n);
         let e = n.effective("stagenet").unwrap();
         assert_eq!((&e["url"], &e["proxy"], &e["proxyRequired"]), (&json!(ONION), &json!("socks5h://127.0.0.1:9250"), &json!(true)));
         assert!(e.get("catchUp").is_none() && n.wants_tor("stagenet"));
 
-        n.set_tor_use("identifying").unwrap();
+        n.set_tor_use("stagenet", "identifying").unwrap();
         let e = n.effective("stagenet").unwrap();
         assert_eq!((&e["url"], &e["catchUp"]["url"], &e["torUse"]), (&json!(ONION), &json!("https://clear.example:38089"), &json!("identifying")));
     }
@@ -1000,13 +1018,13 @@ mod tests {
         let mut n = with_mode("none");
         n.set("stagenet", cfg(ONION)).unwrap();
         assert!(matches!(n.effective("stagenet"), Err(NodeError::TorOff)));
-        n.set_tor_use("identifying").unwrap();
+        n.set_tor_use("stagenet", "identifying").unwrap();
         let e = n.effective("stagenet").unwrap();
         assert_eq!((&e["url"], &e["proxyRequired"]), (&json!(ONION), &json!(true)));
         assert!(e.get("catchUp").is_none());
         // This computer or its network: direct, and trusted only there.
         for mode in ["all", "identifying", "none"] {
-            n.set_tor_use(mode).unwrap();
+            n.set_tor_use("stagenet", mode).unwrap();
             let mut c = cfg("http://192.168.1.4:38081");
             c.trusted = true;
             n.set("stagenet", c).unwrap();
@@ -1053,13 +1071,15 @@ mod tests {
     fn a_health_poll_follows_tor_only_once_chosen_or_asked() {
         let mut n = Nodes::new(None);
         n.set("stagenet", both("https://clear.example:38089")).unwrap();
-        assert!(n.wants_tor("stagenet") && !n.follows_tor());
+        assert!(n.wants_tor("stagenet") && !n.follows_tor("stagenet"));
         let h = n.node_health("stagenet");
         assert_eq!((&h["reachable"], &h["torUseChosen"]), (&json!(false), &json!(false)));
         assert_eq!(h["tor"]["state"], "idle");
         let _ = n.effective("stagenet");
-        assert!(n.follows_tor(), "a wallet asked for the Tor route");
-        assert!(with_mode("identifying").follows_tor());
+        assert!(n.follows_tor("stagenet"), "a wallet asked for the Tor route");
+        let mut chosen = Nodes::new(None);
+        chosen.set_tor_use("mainnet", "identifying").unwrap();
+        assert!(chosen.follows_tor("mainnet") && !chosen.follows_tor("stagenet"), "chosen per network");
     }
 
     #[test]
@@ -1067,12 +1087,13 @@ mod tests {
         let mut n = with_mode("identifying");
         n.set("stagenet", both("https://clear.example:38089")).unwrap();
         n.set_wallet_open("stagenet", true).unwrap();
-        assert!(matches!(n.set_tor_use("none"), Err(NodeError::Locked(_))));
+        assert!(matches!(n.set_tor_use("mainnet", "none"), Err(NodeError::Locked(_))));
         assert!(matches!(n.set("stagenet", cfg("http://other:1")), Err(NodeError::Locked(_))));
         n.set("mainnet", cfg("https://other.example:18089")).unwrap();
         n.set_wallet_open("stagenet", false).unwrap();
-        assert_eq!(n.set_tor_use("none").unwrap()["torUse"], "none");
-        assert!(n.set_tor_use("some").is_err());
+        assert_eq!(n.set_tor_use("stagenet", "none").unwrap()["torUse"], "none");
+        assert!(n.set_tor_use("stagenet", "some").is_err());
+        assert!(matches!(n.set_tor_use("moon", "none"), Err(NodeError::UnknownNetwork(_))));
     }
 
     #[test]
@@ -1080,7 +1101,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("monero_nodes.json");
         let fresh = Nodes::new(Some(p.clone()));
-        assert_eq!(fresh.tor_use(), json!({ "ok": true, "torUse": "identifying", "torUseChosen": false, "existing": false }));
+        assert_eq!(fresh.tor_use("mainnet").unwrap(), json!({ "ok": true, "network": "mainnet", "torUse": "identifying", "torUseChosen": false, "existing": false }));
         std::fs::remove_file(dir.path().join("monero_tor.json")).unwrap();
 
         for (record, mode) in [
@@ -1091,11 +1112,21 @@ mod tests {
             std::fs::write(&p, record).unwrap();
             let _ = std::fs::remove_file(dir.path().join("monero_tor.json"));
             let n = Nodes::new(Some(p.clone()));
-            assert_eq!(n.tor_use(), json!({ "ok": true, "torUse": mode, "torUseChosen": false, "existing": true }), "{record}");
+            assert_eq!(n.tor_use("stagenet").unwrap(), json!({ "ok": true, "network": "stagenet", "torUse": mode, "torUseChosen": false, "existing": true }), "{record}");
+            assert_eq!(n.tor_use("mainnet").unwrap()["existing"], false, "a network never set up starts fresh");
             // Stored at once, so a later load does not migrate again.
             let mut n = Nodes::new(Some(p.clone()));
-            n.set_tor_use("identifying").unwrap();
-            assert_eq!(Nodes::new(Some(p.clone())).tor_use()["torUseChosen"], true);
+            n.set_tor_use("stagenet", "identifying").unwrap();
+            let again = Nodes::new(Some(p.clone()));
+            assert_eq!(again.tor_use("stagenet").unwrap()["torUseChosen"], true);
+            assert_eq!(again.tor_use("mainnet").unwrap()["torUseChosen"], false);
+        }
+
+        // A build with one setting for every network: each network keeps it, and asks again.
+        std::fs::write(dir.path().join("monero_tor.json"), r#"{"torUse":"all","torUseChosen":true,"existing":false}"#).unwrap();
+        let n = Nodes::new(Some(p.clone()));
+        for net in NETWORKS {
+            assert_eq!(n.tor_use(net).unwrap(), json!({ "ok": true, "network": net, "torUse": "all", "torUseChosen": false, "existing": true }));
         }
     }
 
@@ -1361,7 +1392,7 @@ mod tests {
         assert_eq!(asked[1..].iter().cloned().collect::<BTreeSet<_>>(), [direct(CAKE).to_string(), direct(SETH).to_string()].into());
         assert_eq!(stored(&n), (direct(SETH).to_string(), onion(CAKE).to_string()));
         // What a wallet dials follows: the catch-up from Seth's node, then Cake's onion.
-        n.write().unwrap().set_tor_use("identifying").unwrap();
+        n.write().unwrap().set_tor_use("mainnet", "identifying").unwrap();
         let e = n.read().unwrap().effective("mainnet").unwrap();
         assert_eq!((&e["catchUp"]["url"], &e["url"], &e["source"]), (&json!(direct(SETH)), &json!(onion(CAKE)), &json!("default")));
         assert_eq!(Nodes::new(Some(p)).get("mainnet").unwrap().url, direct(SETH));

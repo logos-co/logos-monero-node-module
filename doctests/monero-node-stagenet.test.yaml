@@ -67,8 +67,8 @@ sections:
           printf '%s\n' '{"allowHost":true}' > "$(ls -d "$LOGOSCTL_CONFIG_DIR"/data/monero_node_module/*/ | head -1)callers.json"
           ./logos/bin/logosctl module unload monero_node_module; sleep 1
           ./logos/bin/logosctl module load monero_node_module
-          ./logos/bin/logosctl call monero_node_module tor_use
-          ./logos/bin/logosctl call monero_node_module set_tor_use none
+          ./logos/bin/logosctl call monero_node_module tor_use stagenet
+          ./logos/bin/logosctl call monero_node_module set_tor_use stagenet none
           ./logos/bin/logosctl call monero_node_module init_defaults
           health=$(./logos/bin/logosctl call monero_node_module node_health stagenet)
           case "$health" in
@@ -105,14 +105,14 @@ sections:
           trap './logos/bin/logosctl daemon stop > /dev/null 2>&1 || true' EXIT
           ./logos/bin/logosctl module load monero_node_module
           for mode in none identifying all; do
-            ./logos/bin/logosctl call monero_node_module set_tor_use $mode
+            ./logos/bin/logosctl call monero_node_module set_tor_use stagenet $mode
             ./logos/bin/logosctl call monero_node_module effective_node stagenet
           done
           ./logos/bin/logosctl call monero_node_module set_wallet_open stagenet true
-          ./logos/bin/logosctl call monero_node_module set_tor_use none
+          ./logos/bin/logosctl call monero_node_module set_tor_use stagenet none
           ./logos/bin/logosctl call monero_node_module set_node_config stagenet 'str:{"url":"http://other:38089"}'
           ./logos/bin/logosctl call monero_node_module set_wallet_open stagenet false
-          ./logos/bin/logosctl call monero_node_module tor_use
+          ./logos/bin/logosctl call monero_node_module tor_use stagenet
         expect_contains:
           - '\"route\":\"direct\",\"source\":\"default\",\"timeoutSecs\":8,\"torUse\":\"none\"'
           - '\"catchUp\":{\"url\":\"https://node2.monerodevs.org:38089\"}'
@@ -129,7 +129,7 @@ sections:
           HOME="$PWD/home" ./logos/bin/logosctl daemon start --detach
           trap './logos/bin/logosctl daemon stop > /dev/null 2>&1 || true' EXIT
           ./logos/bin/logosctl module load monero_node_module
-          ./logos/bin/logosctl call monero_node_module set_tor_use all
+          ./logos/bin/logosctl call monero_node_module set_tor_use stagenet all
           for i in $(seq 1 90); do
             health=$(./logos/bin/logosctl call monero_node_module node_health stagenet)
             case "$health" in *'\"reachable\":true'*) break;; esac
@@ -154,7 +154,7 @@ sections:
           HOME="$PWD/home" ./logos/bin/logosctl daemon start --detach
           trap './logos/bin/logosctl daemon stop > /dev/null 2>&1 || true' EXIT
           ./logos/bin/logosctl module load monero_node_module
-          ./logos/bin/logosctl call monero_node_module set_tor_use none
+          ./logos/bin/logosctl call monero_node_module set_tor_use mainnet none
           ./logos/bin/logosctl call monero_node_module effective_node mainnet
           ./logos/bin/logosctl call monero_node_module node_health mainnet
         expect_contains:
@@ -236,13 +236,13 @@ sections:
           HOME="$PWD/home" ./logos/bin/logosctl daemon start --detach
           trap './logos/bin/logosctl daemon stop > /dev/null 2>&1 || true' EXIT
           ./logos/bin/logosctl module load monero_node_module
-          ./logos/bin/logosctl call monero_node_module set_tor_use all
+          ./logos/bin/logosctl call monero_node_module set_tor_use stagenet all
           ./logos/bin/logosctl call monero_node_module set_node_config stagenet 'str:{"url":"http://192.168.1.4:38081","own":true}'
           ./logos/bin/logosctl call monero_node_module effective_node stagenet
           ./logos/bin/logosctl call monero_node_module set_node_config stagenet \
             'str:{"url":"https://my.node.example:38081","own":true,"reachThroughTor":false}'
           ./logos/bin/logosctl call monero_node_module effective_node stagenet
-          ./logos/bin/logosctl call monero_node_module set_tor_use none
+          ./logos/bin/logosctl call monero_node_module set_tor_use stagenet none
           ./logos/bin/logosctl call monero_node_module set_node_config stagenet \
             'str:{"url":"http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:38089","own":true}'
           ./logos/bin/logosctl call monero_node_module effective_node stagenet
