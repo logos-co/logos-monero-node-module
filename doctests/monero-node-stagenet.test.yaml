@@ -229,7 +229,8 @@ sections:
     steps:
       - title: "Your network direct, the internet by its switch, an onion over Tor, then the picked node back"
         # Nothing is dialled here: effective_node only resolves a record you set. The onion
-        # record asks for the built-in Tor, so its proxy reads `tor` while Tor joins.
+        # record asks for the built-in Tor, so its proxy reads `tor` while Tor joins. Sends
+        # (`send`) take a public node over Tor until you pick your node for them.
         run: |
           set -eu
           export LOGOSCTL_CONFIG_DIR="$PWD/session"
@@ -249,9 +250,9 @@ sections:
           ./logos/bin/logosctl call monero_node_module set_node_config stagenet 'str:{"source":"default","url":""}'
           ./logos/bin/logosctl call monero_node_module get_node_config stagenet
         expect_contains:
-          - '\"route\":\"direct\",\"source\":\"external\",\"timeoutSecs\":8,\"torUse\":\"all\",\"trusted\":false,\"url\":\"http://192.168.1.4:38081\"'
-          - '\"route\":\"direct\",\"source\":\"external\",\"timeoutSecs\":8,\"torUse\":\"all\",\"trusted\":false,\"url\":\"https://my.node.example:38081\"'
-          - '\"proxyRequired\":true,\"route\":\"proxied\",\"source\":\"external\"'
+          - '\"route\":\"direct\",\"send\":{\"proxy\":\"tor\",\"url\":\"http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:38089\"},\"source\":\"external\",\"timeoutSecs\":8,\"torUse\":\"all\",\"trusted\":false,\"url\":\"http://192.168.1.4:38081\"'
+          - '\"route\":\"direct\",\"send\":{\"proxy\":\"tor\",\"url\":\"http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:38089\"},\"source\":\"external\",\"timeoutSecs\":8,\"torUse\":\"all\",\"trusted\":false,\"url\":\"https://my.node.example:38081\"'
+          - '\"proxyRequired\":true,\"route\":\"proxied\",\"send\":{\"proxy\":\"tor\",\"url\":\"http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:38089\"},\"source\":\"external\"'
           - '\"torUse\":\"none\",\"trusted\":false,\"url\":\"http://plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:38089\"'
           - '\"source\":\"default\"'
           - '\"url\":\"https://node.sethforprivacy.com:38089\"'
