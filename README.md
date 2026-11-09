@@ -16,7 +16,8 @@ or `{ "ok": false, "error": … }`. Config: `set_node_config` / `get_node_config
 `remove_node_config` / `list_networks` / `config_status` / `init_defaults`. Reads: `node_health`,
 `get_info`, `get_fee_estimate`, `get_version`, `hard_fork_info`, `send_raw_transaction`,
 `generateblocks` (regtest only), plus `raw_json_rpc` / `raw_endpoint` escape hatches. Tor:
-`tor_use`, `set_tor_use`, `set_wallet_open`. Local mode: `effective_node`, `local_node`.
+`tor_use`, `set_tor_use`, `set_wallet_open`. Sending payments: `set_local_sends`. Local mode:
+`effective_node`, `local_node`.
 
 ## Use Tor for
 
@@ -118,6 +119,32 @@ Its address decides the route, and "Use Tor for" does not apply:
 There is never a `catchUp`, and the login goes to `url` over Tor too. It is never probed or moved.
 A record you set on your own network, with no onion address beside it, is marked `own`, on save
 and on load: it was direct in every mode, and stays so. With an onion beside it, it stays a pair.
+
+## Sending payments with your own node
+
+With your own node, in Logos (local mode) or at an address (`own`), a wallet syncs from it, and
+`set_local_sends(network, via)` says where its payments go:
+
+| `localSends` | Payments go | `effective_node` adds |
+|---|---|---|
+| `servers` | to a public node over Tor | `send: { url, proxy }`: the network's onion node, through the network's Tor |
+| `node` | through your node, which passes them to its peers from its IP address, or over Tor when the node in Logos runs with `txProxy` | nothing |
+
+- **Default:** `node` for the node in Logos while `monerod_module` sends over Tor itself (the
+  running node's `status().txProxy` is `on`, or, while it runs no node for this network, its
+  `getConfig(network).txProxy` is true); `servers` otherwise, and always for a node at an
+  address, whose flags we can't see. It is stored in `monero_tor.json` as `localSends` only once
+  picked, so until then it follows the node.
+- **Never your node in its place:** while Tor can't carry the send, `send.proxy` is `tor`, and the
+  wallet core waits. There is no fallback either way.
+- `regtest` lists no public node, so its payments go through your node.
+- `effective_node` also gives `localSends`, the route in effect. `tor_use` and `node_health` add
+  `sends: { localSends, localSendsChosen, localSendsRecommended, sendNode: { url, operator } }`.
+- `set_local_sends` takes the wallet backend only, and is refused while any wallet is open, as
+  `set_tor_use` is.
+- A public route asks tor_module for its port as a Tor route does: Logos' Tor starts for it.
+
+An older wallet core ignores `send` and sends through your node.
 
 ## Local mode
 

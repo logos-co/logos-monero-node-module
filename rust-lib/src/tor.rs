@@ -43,7 +43,25 @@ impl TorUse {
     }
 }
 
-/// One network's "Use Tor for".
+/// With your own node, where payments go out: a public node over Tor, or your node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalSends {
+    Servers,
+    Node,
+}
+
+impl LocalSends {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "servers" => Some(Self::Servers),
+            "node" => Some(Self::Node),
+            _ => None,
+        }
+    }
+}
+
+/// One network's "Use Tor for", and where its payments go with your own node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TorSettings {
     #[serde(rename = "torUse")]
@@ -54,23 +72,26 @@ pub struct TorSettings {
     /// The value was carried over from an install that predates the setting.
     #[serde(default)]
     pub existing: bool,
+    /// The person's pick; absent, it follows your node (`Nodes::sends`). Written only once picked.
+    #[serde(rename = "localSends", default, skip_serializing_if = "Option::is_none")]
+    pub local_sends: Option<LocalSends>,
 }
 
 impl TorSettings {
     pub fn fresh() -> Self {
-        Self { tor_use: TorUse::Identifying, chosen: false, existing: false }
+        Self { tor_use: TorUse::Identifying, chosen: false, existing: false, local_sends: None }
     }
 
     /// Today's routing, nearest mode: a saved proxy is `all` (with that proxy as the user's own
     /// Tor), none is `none`. Never weaker than before, and still to be confirmed by the user.
     pub fn migrated(any_proxy: bool) -> Self {
-        Self { tor_use: if any_proxy { TorUse::All } else { TorUse::None }, chosen: false, existing: true }
+        Self { tor_use: if any_proxy { TorUse::All } else { TorUse::None }, chosen: false, existing: true, local_sends: None }
     }
 
     /// An earlier build's one setting for every network: each network keeps its routing, to be
     /// confirmed there.
     pub fn carried(&self) -> Self {
-        Self { tor_use: self.tor_use, chosen: false, existing: true }
+        Self { tor_use: self.tor_use, chosen: false, existing: true, local_sends: self.local_sends }
     }
 
     pub fn path_beside(registry: &Path) -> PathBuf {
@@ -275,6 +296,6 @@ mod tests {
         // An earlier build's single setting is read as shared, then carried to each network.
         std::fs::write(&p, r#"{"torUse":"none","torUseChosen":true,"existing":false}"#).unwrap();
         let Some(TorLoaded::Shared(old)) = TorFile::load(&p) else { panic!("not read as shared") };
-        assert_eq!(old.carried(), TorSettings { tor_use: TorUse::None, chosen: false, existing: true });
+        assert_eq!(old.carried(), TorSettings { tor_use: TorUse::None, chosen: false, existing: true, local_sends: None });
     }
 }
