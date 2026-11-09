@@ -19,7 +19,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -165,8 +164,8 @@ pub struct Nodes {
     tor_file: TorFile,
     /// The built-in Tor as tor_module last answered, written by the glue.
     tor: Arc<Mutex<Option<TorView>>>,
-    /// A wallet asked for a route through the built-in Tor, so following it may start it.
-    asked: Arc<AtomicBool>,
+    /// Networks a wallet asked a route through the built-in Tor for, so following it may start it.
+    asked: Mutex<BTreeSet<String>>,
     /// Networks the wallet engine has a wallet open on: their settings are locked.
     wallet_open: BTreeSet<String>,
     /// This run's checks of seeded records, per network and half. In memory: a new run checks again.
@@ -201,7 +200,7 @@ impl Nodes {
                 .map(|(net, c)| (net.clone(), TorSettings::migrated(c.proxy_required || c.proxy.as_deref().is_some_and(|p| !p.trim().is_empty()))))
                 .collect() },
         };
-        let mut n = Self { map, path, local: None, tor_file, tor: Arc::default(), asked: Arc::default(),
+        let mut n = Self { map, path, local: None, tor_file, tor: Arc::default(), asked: Mutex::default(),
                            wallet_open: BTreeSet::new(), checks: Mutex::default(), local_private: Mutex::default() };
         if !per_network {
             let _ = n.persist_tor();
@@ -412,12 +411,12 @@ impl Nodes {
     }
 
     /// The SOCKS proxy for a Tor route: your own, or the built-in Tor once it is ready.
-    fn socks(&self, cfg: &NodeConfig) -> Result<String> {
+    fn socks(&self, network: &str, cfg: &NodeConfig) -> Result<String> {
         let p = normalize_proxy(cfg.proxy.as_deref()).map_err(NodeError::Proxy)?;
         if p != BUILT_IN {
             return Ok(p);
         }
-        self.asked.store(true, Ordering::Relaxed);
+        self.asked.lock().unwrap_or_else(|e| e.into_inner()).insert(network.into());
         match self.tor.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             Some(v) if v.usable_socks().is_some() => Ok(v.usable_socks().unwrap().to_string()),
             Some(v) if v.state == "ready" => Err(NodeError::TorNotReady("the Tor SOCKS port is off; turn it on in the Tor app".into())),
@@ -550,7 +549,7 @@ impl Nodes {
         let same = plan.url == c.url;
         let local = c.mode == NodeMode::Local;
         let (proxy, tor_ready) = if plan.via_tor {
-            match self.socks(c) {
+            match self.socks(network, c) {
                 Ok(p) => (Some(p), true),
                 Err(NodeError::TorNotReady(_)) => (Some(BUILT_IN.to_string()), false),
                 Err(e) => return Err(e),
@@ -585,7 +584,7 @@ impl Nodes {
             let send = self.send_node(network).filter(|_| self.sends(network) == LocalSends::Servers);
             v["localSends"] = json!(if send.is_some() { LocalSends::Servers } else { LocalSends::Node });
             if let Some(url) = send {
-                let proxy = match self.socks(c) {
+                let proxy = match self.socks(network, c) {
                     Ok(p) => p,
                     Err(NodeError::TorNotReady(_)) => BUILT_IN.to_string(),
                     Err(e) => return Err(e),
@@ -603,7 +602,7 @@ impl Nodes {
         let same = plan.url == c.url;
         let via_tor = plan.via_tor;
         Ok(NodeConfig {
-            proxy: if via_tor { Some(self.socks(c)?) } else { None },
+            proxy: if via_tor { Some(self.socks(network, c)?) } else { None },
             proxy_required: via_tor,
             timeout_secs: if via_tor { c.timeout_secs.max(TOR_TIMEOUT) } else { c.timeout_secs },
             username: c.username.clone().filter(|_| same && c.mode == NodeMode::Remote),
@@ -747,9 +746,12 @@ impl Nodes {
         }
         let built_in = normalize_proxy(plan.cfg.proxy.as_deref()).is_ok_and(|p| p == BUILT_IN);
         let view = self.tor.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let waiting = built_in && !view.as_ref().is_some_and(|v| v.usable_socks().is_some());
+        // Not over a Tor another network started, before this network's choice: a dial can take 15 s.
+        let followed = !built_in || self.follows_tor(network);
+        let waiting = built_in && (!followed || !view.as_ref().is_some_and(|v| v.usable_socks().is_some()));
         let mut h = if waiting {
             let why = match &view {
+                _ if !followed => "not checked over Tor until you choose Use Tor for".to_string(),
                 None => "Tor has not started yet".to_string(),
                 Some(v) if v.state == "ready" => "the Tor SOCKS port is off".to_string(),
                 Some(v) => format!("waiting for Tor ({}, {}%)", v.state, v.progress),
@@ -913,7 +915,7 @@ impl Nodes {
     /// wallet asked for Tor. Asking starts Tor, and a poll alone must not start it before the
     /// first-run choice.
     pub fn follows_tor(&self, network: &str) -> bool {
-        self.tor_of(network).chosen || self.asked.load(Ordering::Relaxed)
+        self.tor_of(network).chosen || self.asked.lock().unwrap_or_else(|e| e.into_inner()).contains(network)
     }
 
     /// Where the glue writes tor_module's status, without the registry's lock.
@@ -1472,6 +1474,23 @@ mod tests {
     }
 
     #[test]
+    fn tor_your_sends_start_is_followed_on_their_network_only() {
+        let mut n = Nodes::new(None);
+        n.set("stagenet", own("http://192.168.1.5:38081", false)).unwrap();
+        n.set_tor_use("stagenet", "none").unwrap();
+        n.set("mainnet", both("https://clear.example:18089")).unwrap();
+        let _ = n.effective("stagenet");
+        assert!(n.follows_tor("stagenet") && !n.follows_tor("mainnet"));
+        // Mainnet is not dialled over that Tor before its choice: the poll would wait out a 15 s dial.
+        ready_tor(&n);
+        assert!(n.wants_tor("mainnet"));
+        let h = n.node_health("mainnet");
+        assert_eq!((&h["reachable"], &h["error"]), (&json!(false), &json!("not checked over Tor until you choose Use Tor for")));
+        n.set_tor_use("mainnet", "identifying").unwrap();
+        assert_ne!(n.node_health("mainnet")["error"], "not checked over Tor until you choose Use Tor for");
+    }
+
+    #[test]
     fn only_your_own_node_gets_the_choice_and_regtest_sends_through_it() {
         let mut n = Nodes::new(None);
         n.set("stagenet", cfg("https://node2.monerodevs.org:38089")).unwrap();
@@ -1708,7 +1727,7 @@ mod tests {
         let fake = Fake::default().with(direct(PLOWSOF), serving(1));
         tend(&n, "mainnet", &fake);
         assert!(fake.asked().iter().all(|u| !u.starts_with("tor:") && !u.contains(".onion")));
-        assert!(!n.read().unwrap().asked.load(Ordering::Relaxed), "nothing asked for the built-in Tor");
+        assert!(n.read().unwrap().asked.lock().unwrap().is_empty(), "nothing asked for the built-in Tor");
         // With a wallet open in none, the node it dialled stays.
         let n = seeded("none", PLOWSOF, SETH);
         n.write().unwrap().set_wallet_open("mainnet", true).unwrap();

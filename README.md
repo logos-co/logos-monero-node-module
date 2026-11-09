@@ -46,7 +46,9 @@ One setting per network, the same three values as the other Logos wallets: `tor_
   only to `url`, never to a different onion node.
 - **Starting Tor:** tor_module starts when asked. This module asks only for a Tor route through
   the built-in Tor: on a wallet's `effective_node` and on calls, and on a `node_health` poll once
-  the user chose for that network or a wallet asked. At most every 2 s until ready, every 30 s after.
+  the user chose for that network or a wallet asked on it. At most every 2 s until ready, every
+  30 s after. Until then that network's `node_health` is not checked over Tor, even while Tor runs
+  for another network.
 - **Locked while a wallet is open:** the wallet core reports `set_wallet_open(network, open)`;
   while any wallet is open `set_tor_use` answers "Close your open accounts to change this.", and
   `set_node_config` on that network is refused too. `set_tor_use` takes the wallet backend
