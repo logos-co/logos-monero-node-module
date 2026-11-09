@@ -58,10 +58,12 @@ One setting per network, the same three values as the other Logos wallets: `tor_
   `monero_tor.json` from a build with one setting for every network gives each network that
   value, not chosen, so the wallet asks again on each network.
 - **Defaults:** the direct nodes speak TLS (this module accepts monerod's own certificate), the
-  onion nodes are onion services. Mainnet's seed is Cake Wallet's node and plowsof's onion: two
-  operators, so the catch-up node never sees the sends. Stagenet's and testnet's are both
-  plowsof's (`node*.monerodevs.org` and the `plowsof*` onions). Records seeded on the old
-  plain-http defaults move to these on load; a node you picked is left alone.
+  onion nodes are onion services. Each network's seed is two operators', so the catch-up node
+  never sees the sends: on mainnet Cake Wallet's node and plowsof's onion, on stagenet and
+  testnet Seth For Privacy's node (`node.sethforprivacy.com`, listed in feather-nodes'
+  `nodes.yaml`) and plowsof's `plowsof*` onions. Records seeded on the old plain-http defaults, or
+  on plowsof's `node*.monerodevs.org` beside its onion on stagenet and testnet, move to these on
+  load; a node you picked is left alone.
 
 `node_health` adds `torUse`, `torUseChosen`, and on a Tor route `url`, `catchUp` and `tor` (the
 built-in Tor's `{ state, progress, detail, socks, answered }`).
